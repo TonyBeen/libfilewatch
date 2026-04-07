@@ -10,6 +10,7 @@
 #include <vector>
 #include <mutex>
 #include <fstream>
+#include <cstdlib>
 
 #ifdef __linux__
 #include <unistd.h>
@@ -354,6 +355,82 @@ TEST_CASE("FileWatcher class tests", "[FileWatcher]") {
         ::rmdir(nestedDir.c_str());
         ::rmdir(firstLevel.c_str());
         ::rmdir(baseDir.c_str());
+    }
+
+    SECTION("Recursive watch captures copied directory tree") {
+        char tmpTemplate[] = "/tmp/filewatch_copytree_ut_XXXXXX";
+        char* created = mkdtemp(tmpTemplate);
+        REQUIRE(created != nullptr);
+        std::string tmpRoot(created);
+        std::string watchedRoot = tmpRoot + "/watched";
+        std::string seedRoot = tmpRoot + "/seed";
+        std::string seedNested = seedRoot + "/nested";
+        std::string copiedRoot = watchedRoot + "/copied";
+        std::string copiedFile1 = copiedRoot + "/root.txt";
+        std::string copiedFile2 = copiedRoot + "/nested/inner.txt";
+
+        REQUIRE(::mkdir(watchedRoot.c_str(), 0755) == 0);
+        REQUIRE(::mkdir(seedRoot.c_str(), 0755) == 0);
+        REQUIRE(::mkdir(seedNested.c_str(), 0755) == 0);
+        {
+            std::ofstream ofs((seedRoot + "/root.txt").c_str());
+            ofs << "root";
+        }
+        {
+            std::ofstream ofs((seedNested + "/inner.txt").c_str());
+            ofs << "inner";
+        }
+
+        filewatch::FileWatcher watcher(filewatch::LinuxBackend::INOTIFY);
+        std::vector<filewatch::FileEvent> captured;
+        std::mutex capturedMutex;
+
+        bool added = watcher.addWatch(watchedRoot, true, [&captured, &capturedMutex](const filewatch::FileEvent& event) {
+            std::lock_guard<std::mutex> lock(capturedMutex);
+            captured.push_back(event);
+        });
+        REQUIRE(added == true);
+
+        std::atomic<bool> started(false);
+        std::thread startThread([&watcher, &started]() {
+            started = watcher.start();
+        });
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        std::string copyCmd = "cp -r \"" + seedRoot + "\" \"" + copiedRoot + "\"";
+        REQUIRE(std::system(copyCmd.c_str()) == 0);
+        std::this_thread::sleep_for(std::chrono::milliseconds(700));
+
+        watcher.stop();
+        startThread.join();
+        REQUIRE(started == true);
+
+        bool sawCopiedDirCreate = false;
+        bool sawCopiedRootFileCreate = false;
+        bool sawCopiedNestedFileCreate = false;
+
+        {
+            std::lock_guard<std::mutex> lock(capturedMutex);
+            for (size_t i = 0; i < captured.size(); ++i) {
+                const filewatch::FileEvent& e = captured[i];
+                if (e.getType() == filewatch::EventType::CREATE && e.getPathType() == filewatch::PathType::DIRECTORY && e.getPath() == copiedRoot) {
+                    sawCopiedDirCreate = true;
+                }
+                if (e.getType() == filewatch::EventType::CREATE && e.getPath() == copiedFile1) {
+                    sawCopiedRootFileCreate = true;
+                }
+                if (e.getType() == filewatch::EventType::CREATE && e.getPath() == copiedFile2) {
+                    sawCopiedNestedFileCreate = true;
+                }
+            }
+        }
+
+        REQUIRE(sawCopiedDirCreate == true);
+        REQUIRE(sawCopiedRootFileCreate == true);
+        REQUIRE(sawCopiedNestedFileCreate == true);
+
+        std::string cleanupCmd = "rm -rf \"" + tmpRoot + "\"";
+        (void)std::system(cleanupCmd.c_str());
     }
 #endif
 }

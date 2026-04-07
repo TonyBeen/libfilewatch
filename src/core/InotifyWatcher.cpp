@@ -21,6 +21,7 @@ class InotifyWatcher : public PlatformWatcher {
 private:
     int m_inotifyFd;
     std::unordered_map<int, std::string> m_watchMap; // watch descriptor -> path
+    std::unordered_map<int, bool> m_watchRecursive; // watch descriptor -> recursive
     std::atomic<bool> m_running;
     std::function<void(const FileEvent&)> m_callback;
     std::mutex m_mutex;
@@ -61,11 +62,12 @@ public:
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             m_watchMap[wd] = path;
+            m_watchRecursive[wd] = recursive;
         }
 
         // 递归监控子目录
         if (recursive) {
-            addRecursiveWatches(path);
+            addRecursiveWatches(path, true);
         }
 
         return true;
@@ -80,6 +82,7 @@ public:
         for (auto it = m_watchMap.begin(); it != m_watchMap.end(); ++it) {
             if (it->second == path) {
                 inotify_rm_watch(m_inotifyFd, it->first);
+                m_watchRecursive.erase(it->first);
                 m_watchMap.erase(it);
                 return true;
             }
@@ -116,7 +119,7 @@ private:
         return false;
     }
 
-    void addDirectoryWatch(const std::string& path) {
+    void addDirectoryWatch(const std::string& path, bool recursive) {
         if (isPathWatched(path)) {
             return;
         }
@@ -129,6 +132,40 @@ private:
 
         std::lock_guard<std::mutex> lock(m_mutex);
         m_watchMap[wd] = path;
+        m_watchRecursive[wd] = recursive;
+    }
+
+    void emitCreateEventsForExistingEntries(const std::string& path) {
+        DIR* dir = opendir(path.c_str());
+        if (!dir) {
+            return;
+        }
+
+        struct dirent* entry;
+        while ((entry = readdir(dir)) != nullptr) {
+            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+                continue;
+            }
+
+            std::string childPath = path + "/" + entry->d_name;
+            struct stat statbuf;
+            if (stat(childPath.c_str(), &statbuf) != 0) {
+                continue;
+            }
+
+            if (S_ISDIR(statbuf.st_mode)) {
+                if (m_callback) {
+                    m_callback(FileEvent(EventType::CREATE, childPath, PathType::DIRECTORY));
+                }
+                emitCreateEventsForExistingEntries(childPath);
+            } else {
+                if (m_callback) {
+                    m_callback(FileEvent(EventType::CREATE, childPath, PathType::FILE));
+                }
+            }
+        }
+
+        closedir(dir);
     }
 
     void watchLoop() {
@@ -152,9 +189,9 @@ private:
         }
     }
 
-    void addRecursiveWatches(const std::string& path) {
+    void addRecursiveWatches(const std::string& path, bool recursive) {
         // 关键修复：先确保目录本身被监控，再递归子目录。
-        addDirectoryWatch(path);
+        addDirectoryWatch(path, recursive);
 
         DIR* dir = opendir(path.c_str());
         if (!dir) {
@@ -172,7 +209,7 @@ private:
             struct stat statbuf;
             if (stat(childPath.c_str(), &statbuf) == 0 && S_ISDIR(statbuf.st_mode)) {
                 // 递归处理子目录（函数内部会为子目录本身加 watch）
-                addRecursiveWatches(childPath);
+                addRecursiveWatches(childPath, recursive);
             }
         }
 
@@ -181,6 +218,7 @@ private:
 
     void processEvent(struct inotify_event* event) {
         std::string path;
+        bool recursiveWatch = false;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             auto it = m_watchMap.find(event->wd);
@@ -188,6 +226,10 @@ private:
                 return;
             }
             path = it->second;
+            std::unordered_map<int, bool>::const_iterator recursiveIt = m_watchRecursive.find(event->wd);
+            if (recursiveIt != m_watchRecursive.end()) {
+                recursiveWatch = recursiveIt->second;
+            }
         }
 
         if (event->len > 0) {
@@ -204,8 +246,10 @@ private:
         if (event->mask & IN_CREATE) {
             fileEvent = FileEvent(EventType::CREATE, path, pathType);
             // 如果创建的是目录，递归添加监控
-            if (event->mask & IN_ISDIR) {
-                addRecursiveWatches(path);
+            if ((event->mask & IN_ISDIR) && recursiveWatch) {
+                addRecursiveWatches(path, true);
+                // 目录创建后可能已快速写入文件，做一次现状补采样。
+                emitCreateEventsForExistingEntries(path);
             }
         } else if (event->mask & IN_CLOSE_WRITE) {
             // 只有文件保存后才通知 MODIFY
@@ -244,8 +288,10 @@ private:
                 fileEvent = FileEvent(EventType::CREATE, path, pathType);
             }
             // 如果移动的是目录，递归添加监控
-            if (event->mask & IN_ISDIR) {
-                addRecursiveWatches(path);
+            if ((event->mask & IN_ISDIR) && recursiveWatch) {
+                addRecursiveWatches(path, true);
+                // 目录整体移动进来时，补发子树 CREATE 事件，避免漏报。
+                emitCreateEventsForExistingEntries(path);
             }
         }
 
