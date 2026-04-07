@@ -1,4 +1,5 @@
 #include "utils/PathUtils.h"
+#include "utils/EncodingUtils.h"
 
 #ifdef _WIN32
     #include <windows.h>
@@ -28,9 +29,14 @@ std::string PathUtils::normalize(const std::string& path) {
 
 std::string PathUtils::getAbsolutePath(const std::string& path) {
 #ifdef _WIN32
-    char buffer[MAX_PATH];
-    if (GetFullPathNameA(path.c_str(), MAX_PATH, buffer, nullptr) != 0) {
-        return std::string(buffer);
+    std::wstring widePath = EncodingUtils::utf8ToUtf16(path);
+    if (widePath.empty()) {
+        return path;
+    }
+
+    wchar_t buffer[MAX_PATH];
+    if (GetFullPathNameW(widePath.c_str(), MAX_PATH, buffer, nullptr) != 0) {
+        return EncodingUtils::utf16ToUtf8(std::wstring(buffer));
     }
     return path;
 #else
@@ -44,7 +50,11 @@ std::string PathUtils::getAbsolutePath(const std::string& path) {
 
 bool PathUtils::exists(const std::string& path) {
 #ifdef _WIN32
-    DWORD attributes = GetFileAttributesA(path.c_str());
+    std::wstring widePath = EncodingUtils::utf8ToUtf16(path);
+    if (widePath.empty()) {
+        return false;
+    }
+    DWORD attributes = GetFileAttributesW(widePath.c_str());
     return (attributes != INVALID_FILE_ATTRIBUTES);
 #else
     struct stat buffer;
@@ -54,7 +64,11 @@ bool PathUtils::exists(const std::string& path) {
 
 bool PathUtils::isDirectory(const std::string& path) {
 #ifdef _WIN32
-    DWORD attributes = GetFileAttributesA(path.c_str());
+    std::wstring widePath = EncodingUtils::utf8ToUtf16(path);
+    if (widePath.empty()) {
+        return false;
+    }
+    DWORD attributes = GetFileAttributesW(widePath.c_str());
     return (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY));
 #else
     struct stat buffer;
@@ -67,7 +81,11 @@ bool PathUtils::isDirectory(const std::string& path) {
 
 bool PathUtils::isFile(const std::string& path) {
 #ifdef _WIN32
-    DWORD attributes = GetFileAttributesA(path.c_str());
+    std::wstring widePath = EncodingUtils::utf8ToUtf16(path);
+    if (widePath.empty()) {
+        return false;
+    }
+    DWORD attributes = GetFileAttributesW(widePath.c_str());
     return (attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY));
 #else
     struct stat buffer;

@@ -143,7 +143,9 @@ public:
             return false;
         }
 
-        if (!utils::PathUtils::exists(path)) {
+        const std::string normalizedPath = utils::PathUtils::getAbsolutePath(path);
+
+        if (!utils::PathUtils::exists(normalizedPath)) {
             setError(errc::watcher_errc::path_not_exist);
             return false;
         }
@@ -151,17 +153,17 @@ public:
         try {
             {
                 std::lock_guard<std::mutex> lock(m_callbacksMutex);
-                if (m_callbacks.find(path) != m_callbacks.end()) {
+                if (m_callbacks.find(normalizedPath) != m_callbacks.end()) {
                     setError(errc::watcher_errc::already_watching);
                     return false;
                 }
-                m_callbacks[path] = callback;
+                m_callbacks[normalizedPath] = callback;
             }
 
-            if (!m_platformWatcher->addWatch(path, recursive)) {
+            if (!m_platformWatcher->addWatch(normalizedPath, recursive)) {
                 setError(errc::watcher_errc::platform_error);
                 std::lock_guard<std::mutex> lock(m_callbacksMutex);
-                m_callbacks.erase(path);
+                m_callbacks.erase(normalizedPath);
                 return false;
             }
             setError(errc::watcher_errc::success);
@@ -178,12 +180,14 @@ public:
             return false;
         }
 
+        const std::string normalizedPath = utils::PathUtils::getAbsolutePath(path);
+
         try {
             {
                 std::lock_guard<std::mutex> lock(m_callbacksMutex);
-                m_callbacks.erase(path);
+                m_callbacks.erase(normalizedPath);
             }
-            if (!m_platformWatcher->removeWatch(path)) {
+            if (!m_platformWatcher->removeWatch(normalizedPath)) {
                 setError(errc::watcher_errc::platform_error);
                 return false;
             }

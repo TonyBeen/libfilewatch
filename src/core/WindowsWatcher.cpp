@@ -1,4 +1,5 @@
 #include "core/PlatformWatcher.h"
+#include "utils/EncodingUtils.h"
 #include <vector>
 #include <thread>
 #include <atomic>
@@ -96,13 +97,22 @@ private:
     }
 
     bool IsDirectory(const std::string& path) {
-        DWORD attr = GetFileAttributesA(path.c_str());
+        std::wstring widePath = utils::EncodingUtils::utf8ToUtf16(path);
+        if (widePath.empty()) {
+            return false;
+        }
+        DWORD attr = GetFileAttributesW(widePath.c_str());
         return (attr != INVALID_FILE_ATTRIBUTES) && (attr & FILE_ATTRIBUTE_DIRECTORY);
     }
 
     void watchDirectory(const std::string& path, bool recursive) {
-        HANDLE hDir = CreateFileA(
-            path.c_str(),
+        std::wstring widePath = utils::EncodingUtils::utf8ToUtf16(path);
+        if (widePath.empty()) {
+            return;
+        }
+
+        HANDLE hDir = CreateFileW(
+            widePath.c_str(),
             FILE_LIST_DIRECTORY,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             NULL,
@@ -156,12 +166,7 @@ private:
 
                     // 转换文件名（UTF-16 到 UTF-8）
                     std::wstring wideName(notifyInfo->FileName, notifyInfo->FileNameLength / sizeof(wchar_t));
-                    std::string fileName;
-                    int requiredSize = WideCharToMultiByte(CP_UTF8, 0, wideName.c_str(), -1, NULL, 0, NULL, NULL);
-                    if (requiredSize > 0) {
-                        fileName.resize(requiredSize - 1); // 减 1 是因为 WideCharToMultiByte 会添加 null 终止符
-                        WideCharToMultiByte(CP_UTF8, 0, wideName.c_str(), -1, &fileName[0], requiredSize - 1, NULL, NULL);
-                    }
+                    std::string fileName = utils::EncodingUtils::utf16ToUtf8(wideName);
 
                     std::string eventPath = path + "/" + fileName;
                     PathType pathType = PathType::FILE;

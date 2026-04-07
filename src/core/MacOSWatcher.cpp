@@ -3,9 +3,14 @@
 #include <atomic>
 #include <mutex>
 #include <chrono>
+#include <thread>
 #include <functional>
 #include <algorithm>
+#include <unordered_set>
+#include <unordered_map>
+#include <cstring>
 #include <sys/stat.h>
+#include <dirent.h>
 
 #ifdef __APPLE__
 #include <CoreServices/CoreServices.h>
@@ -19,7 +24,9 @@ private:
     std::function<void(const FileEvent&)> m_callback;
     std::mutex m_mutex;
     FSEventStreamRef m_eventStream;
-    CFRunLoopRef m_runLoop;
+    std::unordered_set<std::string> m_knownPaths;
+    std::unordered_map<std::string, PathType> m_knownPathTypes;
+    std::mutex m_knownPathsMutex;
 
     // 事件过滤器
     struct Filter {
@@ -55,7 +62,7 @@ private:
 
 public:
     explicit MacOSWatcher(std::function<void(const FileEvent&)> callback)
-        : m_running(false), m_callback(callback), m_eventStream(nullptr), m_runLoop(nullptr) {
+        : m_running(false), m_callback(callback), m_eventStream(nullptr) {
     }
 
     ~MacOSWatcher() {
@@ -78,6 +85,7 @@ public:
 
         std::lock_guard<std::mutex> lock(m_mutex);
         m_watchList.push_back(path);
+        rememberExistingPathTree(path);
         return true;
     }
 
@@ -115,30 +123,140 @@ public:
             FSEventStreamRelease(m_eventStream);
             m_eventStream = nullptr;
         }
-
-        // 停止 run loop
-        if (m_runLoop) {
-            CFRunLoopStop(m_runLoop);
-            m_runLoop = nullptr;
-        }
     }
 
 private:
+    static bool isPathPrefixOf(const std::string& parent, const std::string& child) {
+        if (child == parent) {
+            return true;
+        }
+        if (child.size() <= parent.size() || child.compare(0, parent.size(), parent) != 0) {
+            return false;
+        }
+        if (!parent.empty() && parent[parent.size() - 1] == '/') {
+            return true;
+        }
+        return child[parent.size()] == '/';
+    }
+
+    static bool pathLengthDesc(const std::pair<std::string, PathType>& a,
+                               const std::pair<std::string, PathType>& b) {
+        if (a.first.size() != b.first.size()) {
+            return a.first.size() > b.first.size();
+        }
+        return a.second == PathType::FILE && b.second == PathType::DIRECTORY;
+    }
+
+    void emitEventIfPasses(const FileEvent& fileEvent) {
+        if (m_filter.passes(fileEvent) && m_callback) {
+            m_callback(fileEvent);
+        }
+    }
+
+    void rememberPath(const std::string& path, PathType pathType) {
+        std::lock_guard<std::mutex> lock(m_knownPathsMutex);
+        m_knownPaths.insert(path);
+        m_knownPathTypes[path] = pathType;
+    }
+
+    void forgetPath(const std::string& path) {
+        std::lock_guard<std::mutex> lock(m_knownPathsMutex);
+        m_knownPaths.erase(path);
+        m_knownPathTypes.erase(path);
+
+        std::unordered_set<std::string>::iterator knownIt = m_knownPaths.begin();
+        while (knownIt != m_knownPaths.end()) {
+            if (isPathPrefixOf(path, *knownIt)) {
+                knownIt = m_knownPaths.erase(knownIt);
+            } else {
+                ++knownIt;
+            }
+        }
+
+        std::unordered_map<std::string, PathType>::iterator typeIt = m_knownPathTypes.begin();
+        while (typeIt != m_knownPathTypes.end()) {
+            if (isPathPrefixOf(path, typeIt->first)) {
+                typeIt = m_knownPathTypes.erase(typeIt);
+            } else {
+                ++typeIt;
+            }
+        }
+    }
+
+    bool hasSeenPath(const std::string& path) {
+        std::lock_guard<std::mutex> lock(m_knownPathsMutex);
+        return m_knownPaths.find(path) != m_knownPaths.end();
+    }
+
+    bool getKnownPathType(const std::string& path, PathType& pathType) {
+        std::lock_guard<std::mutex> lock(m_knownPathsMutex);
+        std::unordered_map<std::string, PathType>::const_iterator it = m_knownPathTypes.find(path);
+        if (it == m_knownPathTypes.end()) {
+            return false;
+        }
+        pathType = it->second;
+        return true;
+    }
+
+    std::vector<std::pair<std::string, PathType> > collectKnownDescendantsForDelete(const std::string& dirPath) {
+        std::vector<std::pair<std::string, PathType> > descendants;
+        std::lock_guard<std::mutex> lock(m_knownPathsMutex);
+        for (std::unordered_map<std::string, PathType>::const_iterator it = m_knownPathTypes.begin(); it != m_knownPathTypes.end(); ++it) {
+            if (it->first != dirPath && isPathPrefixOf(dirPath, it->first)) {
+                descendants.push_back(*it);
+            }
+        }
+        std::sort(descendants.begin(), descendants.end(), pathLengthDesc);
+        return descendants;
+    }
+
+    void rememberExistingPathTree(const std::string& path) {
+        struct stat stat_buf;
+        if (stat(path.c_str(), &stat_buf) != 0) {
+            return;
+        }
+
+        const PathType currentType = S_ISDIR(stat_buf.st_mode) ? PathType::DIRECTORY : PathType::FILE;
+        rememberPath(path, currentType);
+
+        if (!S_ISDIR(stat_buf.st_mode)) {
+            return;
+        }
+
+        DIR* dir = opendir(path.c_str());
+        if (!dir) {
+            return;
+        }
+
+        struct dirent* entry;
+        while ((entry = readdir(dir)) != nullptr) {
+            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+                continue;
+            }
+
+            std::string child = path;
+            if (!child.empty() && child[child.size() - 1] != '/') {
+                child += "/";
+            }
+            child += entry->d_name;
+            rememberExistingPathTree(child);
+        }
+
+        closedir(dir);
+    }
+
     void watchLoop() {
         // 创建 FSEvents 流
         createEventStream();
 
         // 启动 FSEvents 流
         if (m_eventStream) {
-            FSEventStreamScheduleWithRunLoop(m_eventStream, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
+            FSEventStreamSetDispatchQueue(m_eventStream, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
             FSEventStreamStart(m_eventStream);
 
-            // 保存 run loop 引用
-            m_runLoop = CFRunLoopGetCurrent();
-
-            // 运行 run loop
+            // 保持现有阻塞语义，直到 stop() 将 m_running 置为 false
             while (m_running) {
-                CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.1, false);
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
         }
     }
@@ -168,7 +286,7 @@ private:
             pathsToWatch,
             kFSEventStreamEventIdSinceNow,
             0.1, // 事件延迟（秒）
-            kFSEventStreamCreateFlagNone
+            kFSEventStreamCreateFlagFileEvents
         );
 
         // 释放路径数组
@@ -199,41 +317,124 @@ private:
 
     void processEvents(size_t numEvents, void* eventPaths, const FSEventStreamEventFlags eventFlags[]) {
         char** paths = static_cast<char**>(eventPaths);
+        std::vector<std::pair<std::string, PathType> > pendingRenameSources;
 
         for (size_t i = 0; i < numEvents; ++i) {
             std::string path = paths[i];
             EventType eventType = EventType::MODIFY;
             PathType pathType = PathType::FILE;
+            std::string oldPath;
+            PathType oldPathType = PathType::FILE;
+            bool hasOldPath = false;
 
-            // 检查是否为目录
-            struct stat stat_buf;
-            if (stat(path.c_str(), &stat_buf) == 0) {
-                if (S_ISDIR(stat_buf.st_mode)) {
+            const FSEventStreamEventFlags flags = eventFlags[i];
+            const bool seenBefore = hasSeenPath(path);
+
+            // 优先使用 FSEvents 自带类型标记，删除事件下 stat 可能失败。
+            if (flags & kFSEventStreamEventFlagItemIsDir) {
+                pathType = PathType::DIRECTORY;
+            } else if (flags & kFSEventStreamEventFlagItemIsFile) {
+                pathType = PathType::FILE;
+            } else {
+                struct stat stat_buf;
+                if (stat(path.c_str(), &stat_buf) == 0 && S_ISDIR(stat_buf.st_mode)) {
                     pathType = PathType::DIRECTORY;
+                } else {
+                    PathType knownType = PathType::FILE;
+                    if (getKnownPathType(path, knownType)) {
+                        pathType = knownType;
+                    }
                 }
             }
 
-            // 解析事件类型
-            if (eventFlags[i] & kFSEventStreamEventFlagCreated) {
-                eventType = EventType::CREATE;
-            } else if (eventFlags[i] & kFSEventStreamEventFlagRemoved) {
+            // 解析事件类型：先删除，再创建，避免组合标记误判。
+            if (flags & kFSEventStreamEventFlagItemRemoved) {
                 eventType = EventType::DELETE;
-            } else if (eventFlags[i] & kFSEventStreamEventFlagModified) {
+
+                if (pathType == PathType::DIRECTORY) {
+                    std::vector<std::pair<std::string, PathType> > descendants = collectKnownDescendantsForDelete(path);
+                    for (size_t j = 0; j < descendants.size(); ++j) {
+                        FileEvent childDelete(EventType::DELETE, descendants[j].first, descendants[j].second);
+                        emitEventIfPasses(childDelete);
+                    }
+                }
+
+                forgetPath(path);
+            } else if (flags & kFSEventStreamEventFlagItemRenamed) {
+                struct stat stat_buf;
+                const bool pathExists = (stat(path.c_str(), &stat_buf) == 0);
+
+                if (!pathExists) {
+                    // 先缓存为 rename old-path，循环末尾若仍未配对再降级为 DELETE。
+                    pendingRenameSources.push_back(std::make_pair(path, pathType));
+                    continue;
+                } else if (!seenBefore) {
+                    // 优先尝试与同批次中消失的路径配对成 RENAME。
+                    size_t matchedIndex = pendingRenameSources.size();
+                    for (size_t j = 0; j < pendingRenameSources.size(); ++j) {
+                        if (pendingRenameSources[j].second == pathType) {
+                            matchedIndex = j;
+                            break;
+                        }
+                    }
+
+                    if (matchedIndex < pendingRenameSources.size()) {
+                        eventType = EventType::RENAME;
+                        oldPath = pendingRenameSources[matchedIndex].first;
+                        oldPathType = pendingRenameSources[matchedIndex].second;
+                        hasOldPath = true;
+                        pendingRenameSources.erase(pendingRenameSources.begin() + matchedIndex);
+                        forgetPath(oldPath);
+                        rememberPath(path, pathType);
+                    } else {
+                        // 路径存在且首次出现，更接近“新建/移动进入监控范围”。
+                        eventType = EventType::CREATE;
+                        rememberPath(path, pathType);
+                    }
+                } else {
+                    eventType = EventType::RENAME;
+                    rememberPath(path, pathType);
+                }
+            } else if (flags & kFSEventStreamEventFlagItemCreated) {
+                // 某些编辑器在覆盖保存时可能仍带 Created 标记；已存在路径按 MODIFY 处理。
+                eventType = seenBefore ? EventType::MODIFY : EventType::CREATE;
+                rememberPath(path, pathType);
+            } else if ((flags & kFSEventStreamEventFlagItemModified) ||
+                       (flags & kFSEventStreamEventFlagItemInodeMetaMod) ||
+                       (flags & kFSEventStreamEventFlagItemFinderInfoMod) ||
+                       (flags & kFSEventStreamEventFlagItemChangeOwner) ||
+                       (flags & kFSEventStreamEventFlagItemXattrMod)) {
                 eventType = EventType::MODIFY;
-            } else if (eventFlags[i] & kFSEventStreamEventFlagRenamed) {
-                eventType = EventType::RENAME;
+                rememberPath(path, pathType);
+            }
+
+            // 目录的元数据变化噪声较多，这里抑制 DIRECTORY + MODIFY 事件。
+            if (pathType == PathType::DIRECTORY && eventType == EventType::MODIFY) {
+                continue;
             }
 
             // 创建 FileEvent 对象
-            FileEvent fileEvent(eventType, path, pathType);
+            FileEvent fileEvent(eventType, path, pathType, hasOldPath ? oldPath : "", oldPathType);
 
-            // 检查事件是否通过过滤
-            if (m_filter.passes(fileEvent)) {
-                // 调用回调函数
-                if (m_callback) {
-                    m_callback(fileEvent);
+            emitEventIfPasses(fileEvent);
+        }
+
+        // 未配对的 rename old-path 视为删除，保证不会丢失事件。
+        for (size_t i = 0; i < pendingRenameSources.size(); ++i) {
+            const std::string& oldPath = pendingRenameSources[i].first;
+            const PathType oldType = pendingRenameSources[i].second;
+
+            if (oldType == PathType::DIRECTORY) {
+                std::vector<std::pair<std::string, PathType> > descendants = collectKnownDescendantsForDelete(oldPath);
+                for (size_t j = 0; j < descendants.size(); ++j) {
+                    FileEvent childDelete(EventType::DELETE, descendants[j].first, descendants[j].second);
+                    emitEventIfPasses(childDelete);
                 }
             }
+
+            forgetPath(oldPath);
+            FileEvent deleteEvent(EventType::DELETE, oldPath, oldType);
+            emitEventIfPasses(deleteEvent);
         }
     }
 };
