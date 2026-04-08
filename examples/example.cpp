@@ -13,10 +13,10 @@ namespace {
 
 const char* eventTypeToString(filewatch::EventType type) {
     switch (type) {
-        case filewatch::EventType::CREATE: return "CREATE";
-        case filewatch::EventType::MODIFY: return "MODIFY";
-        case filewatch::EventType::DELETE: return "DELETE";
-        case filewatch::EventType::RENAME: return "RENAME";
+        case filewatch::EventType::kCreate: return "CREATE";
+        case filewatch::EventType::kModify: return "MODIFY";
+        case filewatch::EventType::kDelete: return "DELETE";
+        case filewatch::EventType::kRename: return "RENAME";
         default: return "UNKNOWN";
     }
 }
@@ -61,19 +61,19 @@ std::string toLower(const std::string& value) {
 bool parseEventType(const std::string& token, filewatch::EventType& type) {
     const std::string name = toLower(token);
     if (name == "create") {
-        type = filewatch::EventType::CREATE;
+        type = filewatch::EventType::kCreate;
         return true;
     }
     if (name == "modify") {
-        type = filewatch::EventType::MODIFY;
+        type = filewatch::EventType::kModify;
         return true;
     }
     if (name == "delete") {
-        type = filewatch::EventType::DELETE;
+        type = filewatch::EventType::kDelete;
         return true;
     }
     if (name == "rename") {
-        type = filewatch::EventType::RENAME;
+        type = filewatch::EventType::kRename;
         return true;
     }
     return false;
@@ -87,7 +87,7 @@ bool parseEvents(const std::string& text, std::vector<filewatch::EventType>& eve
         if (token.empty()) {
             continue;
         }
-        filewatch::EventType type = filewatch::EventType::MODIFY;
+        filewatch::EventType type = filewatch::EventType::kModify;
         if (!parseEventType(token, type)) {
             return false;
         }
@@ -203,7 +203,7 @@ int main(int argc, char** argv) {
                   << "(" << pathTypeToString(event.getPathType()) << ") "
                   << event.getPath();
 
-        if (event.getType() == filewatch::EventType::RENAME) {
+        if (event.getType() == filewatch::EventType::kRename) {
             std::cout << " <= " << event.getOldPath();
         }
         std::cout << std::endl;

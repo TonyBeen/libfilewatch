@@ -321,7 +321,7 @@ private:
 
         for (size_t i = 0; i < numEvents; ++i) {
             std::string path = paths[i];
-            EventType eventType = EventType::MODIFY;
+            EventType eventType = EventType::kModify;
             PathType pathType = PathType::FILE;
             std::string oldPath;
             PathType oldPathType = PathType::FILE;
@@ -349,12 +349,12 @@ private:
 
             // 解析事件类型：先删除，再创建，避免组合标记误判。
             if (flags & kFSEventStreamEventFlagItemRemoved) {
-                eventType = EventType::DELETE;
+                eventType = EventType::kDelete;
 
                 if (pathType == PathType::DIRECTORY) {
                     std::vector<std::pair<std::string, PathType> > descendants = collectKnownDescendantsForDelete(path);
                     for (size_t j = 0; j < descendants.size(); ++j) {
-                        FileEvent childDelete(EventType::DELETE, descendants[j].first, descendants[j].second);
+                        FileEvent childDelete(EventType::kDelete, descendants[j].first, descendants[j].second);
                         emitEventIfPasses(childDelete);
                     }
                 }
@@ -379,7 +379,7 @@ private:
                     }
 
                     if (matchedIndex < pendingRenameSources.size()) {
-                        eventType = EventType::RENAME;
+                        eventType = EventType::kRename;
                         oldPath = pendingRenameSources[matchedIndex].first;
                         oldPathType = pendingRenameSources[matchedIndex].second;
                         hasOldPath = true;
@@ -388,28 +388,28 @@ private:
                         rememberPath(path, pathType);
                     } else {
                         // 路径存在且首次出现，更接近“新建/移动进入监控范围”。
-                        eventType = EventType::CREATE;
+                        eventType = EventType::kCreate;
                         rememberPath(path, pathType);
                     }
                 } else {
-                    eventType = EventType::RENAME;
+                    eventType = EventType::kRename;
                     rememberPath(path, pathType);
                 }
             } else if (flags & kFSEventStreamEventFlagItemCreated) {
                 // 某些编辑器在覆盖保存时可能仍带 Created 标记；已存在路径按 MODIFY 处理。
-                eventType = seenBefore ? EventType::MODIFY : EventType::CREATE;
+                eventType = seenBefore ? EventType::kModify : EventType::kCreate;
                 rememberPath(path, pathType);
             } else if ((flags & kFSEventStreamEventFlagItemModified) ||
                        (flags & kFSEventStreamEventFlagItemInodeMetaMod) ||
                        (flags & kFSEventStreamEventFlagItemFinderInfoMod) ||
                        (flags & kFSEventStreamEventFlagItemChangeOwner) ||
                        (flags & kFSEventStreamEventFlagItemXattrMod)) {
-                eventType = EventType::MODIFY;
+                eventType = EventType::kModify;
                 rememberPath(path, pathType);
             }
 
             // 目录的元数据变化噪声较多，这里抑制 DIRECTORY + MODIFY 事件。
-            if (pathType == PathType::DIRECTORY && eventType == EventType::MODIFY) {
+            if (pathType == PathType::DIRECTORY && eventType == EventType::kModify) {
                 continue;
             }
 
@@ -427,13 +427,13 @@ private:
             if (oldType == PathType::DIRECTORY) {
                 std::vector<std::pair<std::string, PathType> > descendants = collectKnownDescendantsForDelete(oldPath);
                 for (size_t j = 0; j < descendants.size(); ++j) {
-                    FileEvent childDelete(EventType::DELETE, descendants[j].first, descendants[j].second);
+                    FileEvent childDelete(EventType::kDelete, descendants[j].first, descendants[j].second);
                     emitEventIfPasses(childDelete);
                 }
             }
 
             forgetPath(oldPath);
-            FileEvent deleteEvent(EventType::DELETE, oldPath, oldType);
+            FileEvent deleteEvent(EventType::kDelete, oldPath, oldType);
             emitEventIfPasses(deleteEvent);
         }
     }

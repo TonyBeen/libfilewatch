@@ -21,6 +21,7 @@ class InotifyWatcher : public PlatformWatcher {
 private:
     int m_inotifyFd;
     std::unordered_map<int, std::string> m_watchMap; // watch descriptor -> path
+    std::unordered_map<std::string, int> m_pathWatchMap; // path -> watch descriptor
     std::unordered_map<int, bool> m_watchRecursive; // watch descriptor -> recursive
     std::atomic<bool> m_running;
     std::function<void(const FileEvent&)> m_callback;
@@ -62,6 +63,7 @@ public:
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             m_watchMap[wd] = path;
+            m_pathWatchMap[path] = wd;
             m_watchRecursive[wd] = recursive;
         }
 
@@ -79,15 +81,17 @@ public:
         }
 
         std::lock_guard<std::mutex> lock(m_mutex);
-        for (auto it = m_watchMap.begin(); it != m_watchMap.end(); ++it) {
-            if (it->second == path) {
-                inotify_rm_watch(m_inotifyFd, it->first);
-                m_watchRecursive.erase(it->first);
-                m_watchMap.erase(it);
-                return true;
-            }
+        std::unordered_map<std::string, int>::iterator pathIt = m_pathWatchMap.find(path);
+        if (pathIt == m_pathWatchMap.end()) {
+            return false;
         }
-        return false;
+
+        const int wd = pathIt->second;
+        inotify_rm_watch(m_inotifyFd, wd);
+        m_watchRecursive.erase(wd);
+        m_watchMap.erase(wd);
+        m_pathWatchMap.erase(pathIt);
+        return true;
     }
 
     bool start() override {
@@ -111,12 +115,7 @@ public:
 private:
     bool isPathWatched(const std::string& path) {
         std::lock_guard<std::mutex> lock(m_mutex);
-        for (std::unordered_map<int, std::string>::const_iterator it = m_watchMap.begin(); it != m_watchMap.end(); ++it) {
-            if (it->second == path) {
-                return true;
-            }
-        }
-        return false;
+        return m_pathWatchMap.find(path) != m_pathWatchMap.end();
     }
 
     void addDirectoryWatch(const std::string& path, bool recursive) {
@@ -132,6 +131,7 @@ private:
 
         std::lock_guard<std::mutex> lock(m_mutex);
         m_watchMap[wd] = path;
+        m_pathWatchMap[path] = wd;
         m_watchRecursive[wd] = recursive;
     }
 
@@ -155,12 +155,12 @@ private:
 
             if (S_ISDIR(statbuf.st_mode)) {
                 if (m_callback) {
-                    m_callback(FileEvent(EventType::CREATE, childPath, PathType::DIRECTORY));
+                    m_callback(FileEvent(EventType::kCreate, childPath, PathType::DIRECTORY));
                 }
                 emitCreateEventsForExistingEntries(childPath);
             } else {
                 if (m_callback) {
-                    m_callback(FileEvent(EventType::CREATE, childPath, PathType::FILE));
+                    m_callback(FileEvent(EventType::kCreate, childPath, PathType::FILE));
                 }
             }
         }
@@ -169,7 +169,7 @@ private:
     }
 
     void watchLoop() {
-        char buffer[4096];
+        char buffer[64 * 1024];
         while (m_running) {
             int len = read(m_inotifyFd, buffer, sizeof(buffer));
             if (len == -1) {
@@ -181,10 +181,16 @@ private:
                 continue;
             }
 
-            for (char* p = buffer; p < buffer + len;) {
+            char* p = buffer;
+            char* end = buffer + len;
+            while (p + static_cast<int>(sizeof(struct inotify_event)) <= end) {
                 struct inotify_event* event = reinterpret_cast<struct inotify_event*>(p);
+                const size_t eventSize = sizeof(struct inotify_event) + event->len;
+                if (p + static_cast<int>(eventSize) > end) {
+                    break;
+                }
                 processEvent(event);
-                p += sizeof(struct inotify_event) + event->len;
+                p += eventSize;
             }
         }
     }
@@ -241,10 +247,10 @@ private:
             pathType = PathType::DIRECTORY;
         }
 
-        FileEvent fileEvent(EventType::CREATE, path, pathType);
+        FileEvent fileEvent(EventType::kCreate, path, pathType);
 
         if (event->mask & IN_CREATE) {
-            fileEvent = FileEvent(EventType::CREATE, path, pathType);
+            fileEvent = FileEvent(EventType::kCreate, path, pathType);
             // 如果创建的是目录，递归添加监控
             if ((event->mask & IN_ISDIR) && recursiveWatch) {
                 addRecursiveWatches(path, true);
@@ -253,9 +259,9 @@ private:
             }
         } else if (event->mask & IN_CLOSE_WRITE) {
             // 只有文件保存后才通知 MODIFY
-            fileEvent = FileEvent(EventType::MODIFY, path, pathType);
+            fileEvent = FileEvent(EventType::kModify, path, pathType);
         } else if (event->mask & IN_DELETE) {
-            fileEvent = FileEvent(EventType::DELETE, path, pathType);
+            fileEvent = FileEvent(EventType::kDelete, path, pathType);
         } else if (event->mask & IN_MOVED_FROM) {
             // 存储重命名事件的旧路径信息
             RenameInfo info;
@@ -282,10 +288,10 @@ private:
 
             if (hasRenameInfo) {
                 // 创建重命名事件
-                fileEvent = FileEvent(EventType::RENAME, path, pathType, renameInfo.oldPath, renameInfo.oldPathType);
+                fileEvent = FileEvent(EventType::kRename, path, pathType, renameInfo.oldPath, renameInfo.oldPathType);
             } else {
                 // 如果没有对应的 IN_MOVED_FROM 事件，当作创建事件处理
-                fileEvent = FileEvent(EventType::CREATE, path, pathType);
+                fileEvent = FileEvent(EventType::kCreate, path, pathType);
             }
             // 如果移动的是目录，递归添加监控
             if ((event->mask & IN_ISDIR) && recursiveWatch) {

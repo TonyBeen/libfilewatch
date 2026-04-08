@@ -9,10 +9,10 @@ namespace filewatch {
  * 事件类型枚举
  */
 enum class EventType {
-    CREATE,    // 文件/目录创建
-    MODIFY,    // 文件修改
-    DELETE,    // 文件/目录删除
-    RENAME     // 文件/目录重命名
+    kCreate,    // 文件/目录创建
+    kModify,    // 文件修改
+    kDelete,    // 文件/目录删除
+    kRename     // 文件/目录重命名
 };
 
 /**

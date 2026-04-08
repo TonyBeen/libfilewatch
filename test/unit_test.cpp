@@ -20,8 +20,8 @@
 // 测试 Event 类
 TEST_CASE("Event class tests", "[Event]") {
     SECTION("Default constructor") {
-        filewatch::FileEvent event(filewatch::EventType::CREATE, "test.txt", filewatch::PathType::FILE);
-        REQUIRE(event.getType() == filewatch::EventType::CREATE);
+        filewatch::FileEvent event(filewatch::EventType::kCreate, "test.txt", filewatch::PathType::FILE);
+        REQUIRE(event.getType() == filewatch::EventType::kCreate);
         REQUIRE(event.getPath() == "test.txt");
         REQUIRE(event.getPathType() == filewatch::PathType::FILE);
         REQUIRE(event.getOldPath() == "");
@@ -30,13 +30,13 @@ TEST_CASE("Event class tests", "[Event]") {
 
     SECTION("Constructor with old path") {
         filewatch::FileEvent event(
-            filewatch::EventType::RENAME, 
+            filewatch::EventType::kRename, 
             "new.txt", 
             filewatch::PathType::FILE, 
             "old.txt", 
             filewatch::PathType::FILE
         );
-        REQUIRE(event.getType() == filewatch::EventType::RENAME);
+        REQUIRE(event.getType() == filewatch::EventType::kRename);
         REQUIRE(event.getPath() == "new.txt");
         REQUIRE(event.getPathType() == filewatch::PathType::FILE);
         REQUIRE(event.getOldPath() == "old.txt");
@@ -44,8 +44,8 @@ TEST_CASE("Event class tests", "[Event]") {
     }
 
     SECTION("Directory event") {
-        filewatch::FileEvent event(filewatch::EventType::CREATE, "test_dir", filewatch::PathType::DIRECTORY);
-        REQUIRE(event.getType() == filewatch::EventType::CREATE);
+        filewatch::FileEvent event(filewatch::EventType::kCreate, "test_dir", filewatch::PathType::DIRECTORY);
+        REQUIRE(event.getType() == filewatch::EventType::kCreate);
         REQUIRE(event.getPath() == "test_dir");
         REQUIRE(event.getPathType() == filewatch::PathType::DIRECTORY);
     }
@@ -204,7 +204,7 @@ TEST_CASE("FileWatcher class tests", "[FileWatcher]") {
 
         // 创建过滤器
         filewatch::FileWatcher::Filter filter;
-        filter.setEventTypes({filewatch::EventType::CREATE, filewatch::EventType::MODIFY});
+        filter.setEventTypes({filewatch::EventType::kCreate, filewatch::EventType::kModify});
         filter.setExtensions({"txt", "cpp"});
         filter.setPathPattern(".*test.*");
 
@@ -323,22 +323,22 @@ TEST_CASE("FileWatcher class tests", "[FileWatcher]") {
             std::lock_guard<std::mutex> lock(capturedMutex);
             for (size_t i = 0; i < captured.size(); ++i) {
                 const filewatch::FileEvent& e = captured[i];
-                if (e.getType() == filewatch::EventType::CREATE && e.getPathType() == filewatch::PathType::DIRECTORY && e.getPath() == firstLevel) {
+                if (e.getType() == filewatch::EventType::kCreate && e.getPathType() == filewatch::PathType::DIRECTORY && e.getPath() == firstLevel) {
                     sawFirstLevelCreate = true;
                 }
-                if (e.getType() == filewatch::EventType::CREATE && e.getPathType() == filewatch::PathType::DIRECTORY && e.getPath() == nestedDir) {
+                if (e.getType() == filewatch::EventType::kCreate && e.getPathType() == filewatch::PathType::DIRECTORY && e.getPath() == nestedDir) {
                     sawNestedDirCreate = true;
                 }
-                if (e.getType() == filewatch::EventType::CREATE && e.getPath() == file1) {
+                if (e.getType() == filewatch::EventType::kCreate && e.getPath() == file1) {
                     sawNestedFileCreate = true;
                 }
-                if (e.getType() == filewatch::EventType::MODIFY && e.getPath() == file1) {
+                if (e.getType() == filewatch::EventType::kModify && e.getPath() == file1) {
                     sawNestedFileModify = true;
                 }
-                if (e.getType() == filewatch::EventType::RENAME && e.getPath() == file2 && e.getOldPath() == file1) {
+                if (e.getType() == filewatch::EventType::kRename && e.getPath() == file2 && e.getOldPath() == file1) {
                     sawNestedFileRename = true;
                 }
-                if (e.getType() == filewatch::EventType::DELETE && e.getPath() == file2) {
+                if (e.getType() == filewatch::EventType::kDelete && e.getPath() == file2) {
                     sawNestedFileDelete = true;
                 }
             }
@@ -413,13 +413,13 @@ TEST_CASE("FileWatcher class tests", "[FileWatcher]") {
             std::lock_guard<std::mutex> lock(capturedMutex);
             for (size_t i = 0; i < captured.size(); ++i) {
                 const filewatch::FileEvent& e = captured[i];
-                if (e.getType() == filewatch::EventType::CREATE && e.getPathType() == filewatch::PathType::DIRECTORY && e.getPath() == copiedRoot) {
+                if (e.getType() == filewatch::EventType::kCreate && e.getPathType() == filewatch::PathType::DIRECTORY && e.getPath() == copiedRoot) {
                     sawCopiedDirCreate = true;
                 }
-                if (e.getType() == filewatch::EventType::CREATE && e.getPath() == copiedFile1) {
+                if (e.getType() == filewatch::EventType::kCreate && e.getPath() == copiedFile1) {
                     sawCopiedRootFileCreate = true;
                 }
-                if (e.getType() == filewatch::EventType::CREATE && e.getPath() == copiedFile2) {
+                if (e.getType() == filewatch::EventType::kCreate && e.getPath() == copiedFile2) {
                     sawCopiedNestedFileCreate = true;
                 }
             }

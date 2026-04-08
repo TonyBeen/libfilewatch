@@ -128,7 +128,10 @@ std::error_code make_error_code(errc::watcher_errc e) noexcept {
 class FileWatcher::Impl {
 public:
     Impl(LinuxBackend backend) : m_lastError(make_error_code(errc::watcher_errc::success)),
-                                m_debounceTime(50) {
+                                m_debounceTime(50),
+                                m_debounceCleanupIntervalMs(30000),
+                                m_debounceExpireMs(120000),
+                                m_lastDebounceCleanup(std::chrono::steady_clock::now()) {
         m_platformWatcher = createPlatformWatcher(backend, [this](const FileEvent& event) {
             processEvent(event);
         });
@@ -293,6 +296,28 @@ private:
     std::unordered_map<std::string, std::chrono::steady_clock::time_point> m_debounceMap; // 防抖映射
     std::mutex m_debounceMutex; // 防抖互斥锁
     int m_debounceTime; // 防抖时间（毫秒）
+    int m_debounceCleanupIntervalMs; // 防抖表清理间隔
+    int m_debounceExpireMs; // 防抖表过期时间
+    std::chrono::steady_clock::time_point m_lastDebounceCleanup; // 上次清理时间
+
+    void cleanupDebounceMap(const std::chrono::steady_clock::time_point& now) {
+        const long sinceLastCleanup = std::chrono::duration_cast<std::chrono::milliseconds>(now - m_lastDebounceCleanup).count();
+        if (sinceLastCleanup < m_debounceCleanupIntervalMs) {
+            return;
+        }
+
+        const long expireMs = m_debounceExpireMs;
+        for (std::unordered_map<std::string, std::chrono::steady_clock::time_point>::iterator it = m_debounceMap.begin(); it != m_debounceMap.end();) {
+            const long age = std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second).count();
+            if (age > expireMs) {
+                it = m_debounceMap.erase(it);
+            } else {
+                ++it;
+            }
+        }
+
+        m_lastDebounceCleanup = now;
+    }
 
     void processEvent(const FileEvent& event) {
         FileWatcher::Filter currentFilter;
@@ -316,7 +341,7 @@ private:
 
     bool applyDebounce(const FileEvent& event) {
         // 只对 MODIFY 事件应用防抖
-        if (event.getType() != EventType::MODIFY) {
+        if (event.getType() != EventType::kModify) {
             return false;
         }
 
@@ -324,6 +349,8 @@ private:
         auto now = std::chrono::steady_clock::now();
 
         std::lock_guard<std::mutex> lock(m_debounceMutex);
+        cleanupDebounceMap(now);
+
         auto it = m_debounceMap.find(path);
         if (it != m_debounceMap.end()) {
             auto lastTime = it->second;

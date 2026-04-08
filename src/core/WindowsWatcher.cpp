@@ -180,16 +180,16 @@ private:
                     }
 
                     // 解析事件类型
-                    EventType eventType = EventType::MODIFY;
+                    EventType eventType = EventType::kModify;
                     switch (notifyInfo->Action) {
                         case FILE_ACTION_ADDED:
-                            eventType = EventType::CREATE;
+                            eventType = EventType::kCreate;
                             break;
                         case FILE_ACTION_REMOVED:
-                            eventType = EventType::DELETE;
+                            eventType = EventType::kDelete;
                             break;
                         case FILE_ACTION_MODIFIED:
-                            eventType = EventType::MODIFY;
+                            eventType = EventType::kModify;
                             break;
                         case FILE_ACTION_RENAMED_OLD_NAME:
                             // 存储重命名事件的旧路径信息
@@ -198,7 +198,7 @@ private:
                             break;
                         case FILE_ACTION_RENAMED_NEW_NAME:
                             // 创建重命名事件
-                            eventType = EventType::RENAME;
+                            eventType = EventType::kRename;
                             // 调用回调函数
                             if (m_callback) {
                                 FileEvent fileEvent(eventType, eventPath, pathType, m_renameInfo.oldPath, m_renameInfo.oldPathType);

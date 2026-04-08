@@ -136,14 +136,14 @@ private:
         close(metadata->fd);
 
         // 解析事件类型
-        EventType eventType = EventType::MODIFY;
+        EventType eventType = EventType::kModify;
         if (metadata->mask & FAN_CREATE) {
-            eventType = EventType::CREATE;
+            eventType = EventType::kCreate;
         } else if (metadata->mask & FAN_DELETE) {
-            eventType = EventType::DELETE;
+            eventType = EventType::kDelete;
         } else if (metadata->mask & FAN_CLOSE_WRITE) {
             // 只有文件保存后才通知 MODIFY
-            eventType = EventType::MODIFY;
+            eventType = EventType::kModify;
         } else {
             // 其他事件（如属性修改、文件访问等）可以忽略
             return;
