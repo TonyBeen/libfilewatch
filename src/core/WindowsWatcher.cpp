@@ -1,5 +1,6 @@
 #include "core/PlatformWatcher.h"
 #include "utils/EncodingUtils.h"
+#include "utils/PathUtils.h"
 #include <vector>
 #include <thread>
 #include <atomic>
@@ -7,6 +8,7 @@
 #include <chrono>
 #include <functional>
 #include <algorithm>
+#include <unordered_map>
 
 #ifdef _WIN32
 #include <Windows.h>
@@ -31,6 +33,7 @@ private:
     std::function<void(const FileEvent&)> m_callback;
     std::mutex m_mutex;
     RenameInfo m_renameInfo;
+    std::unordered_map<std::string, PathType> m_knownPathTypes;
 
 public:
     explicit WindowsWatcher(std::function<void(const FileEvent&)> callback)
@@ -45,15 +48,19 @@ public:
 
     bool addWatch(const std::string& path, bool recursive) override {
         std::lock_guard<std::mutex> lock(m_mutex);
-        m_watchList.push_back({path, recursive});
+        const std::string normalizedPath = utils::PathUtils::normalize(path);
+        m_watchList.push_back({normalizedPath, recursive});
+        m_knownPathTypes[normalizedPath] = PathType::DIRECTORY;
         return true;
     }
 
     bool removeWatch(const std::string& path) override {
         std::lock_guard<std::mutex> lock(m_mutex);
+        const std::string normalizedPath = utils::PathUtils::normalize(path);
         auto it = std::find_if(m_watchList.begin(), m_watchList.end(), 
-            [&path](const WatchInfo& info) { return info.path == path; });
+            [&normalizedPath](const WatchInfo& info) { return info.path == normalizedPath; });
         if (it != m_watchList.end()) {
+            m_knownPathTypes.erase(it->path);
             m_watchList.erase(it);
             return true;
         }
@@ -79,6 +86,17 @@ public:
     }
 
 private:
+    std::string joinWindowsPath(const std::string& base, const std::string& child) {
+        if (base.empty()) {
+            return utils::PathUtils::normalize(child);
+        }
+        const char last = base[base.size() - 1];
+        if (last == '\\' || last == '/') {
+            return utils::PathUtils::normalize(base + child);
+        }
+        return utils::PathUtils::normalize(base + "\\" + child);
+    }
+
     void watchLoop() {
         while (m_running) {
             std::vector<WatchInfo> watchListSnapshot;
@@ -168,53 +186,75 @@ private:
                     std::wstring wideName(notifyInfo->FileName, notifyInfo->FileNameLength / sizeof(wchar_t));
                     std::string fileName = utils::EncodingUtils::utf16ToUtf8(wideName);
 
-                    std::string eventPath = path + "/" + fileName;
+                    std::string eventPath = joinWindowsPath(path, fileName);
                     PathType pathType = PathType::FILE;
-
-                    // 检查是否为目录
-                    if ((notifyInfo->Action == FILE_ACTION_ADDED && IsDirectory(eventPath)) ||
-                        (notifyInfo->Action == FILE_ACTION_REMOVED && IsDirectory(eventPath)) ||
-                        (notifyInfo->Action == FILE_ACTION_RENAMED_OLD_NAME && IsDirectory(eventPath)) || 
-                        (notifyInfo->Action == FILE_ACTION_RENAMED_NEW_NAME && IsDirectory(eventPath))) {
-                        pathType = PathType::DIRECTORY;
-                    }
 
                     // 解析事件类型
                     EventType eventType = EventType::kModify;
                     switch (notifyInfo->Action) {
                         case FILE_ACTION_ADDED:
                             eventType = EventType::kCreate;
+                            pathType = IsDirectory(eventPath) ? PathType::DIRECTORY : PathType::FILE;
+                            {
+                                std::lock_guard<std::mutex> lock(m_mutex);
+                                m_knownPathTypes[eventPath] = pathType;
+                            }
                             break;
                         case FILE_ACTION_REMOVED:
                             eventType = EventType::kDelete;
+                            {
+                                std::lock_guard<std::mutex> lock(m_mutex);
+                                std::unordered_map<std::string, PathType>::iterator it = m_knownPathTypes.find(eventPath);
+                                if (it != m_knownPathTypes.end()) {
+                                    pathType = it->second;
+                                    m_knownPathTypes.erase(it);
+                                }
+                            }
                             break;
                         case FILE_ACTION_MODIFIED:
                             eventType = EventType::kModify;
+                            {
+                                std::lock_guard<std::mutex> lock(m_mutex);
+                                std::unordered_map<std::string, PathType>::iterator it = m_knownPathTypes.find(eventPath);
+                                if (it != m_knownPathTypes.end()) {
+                                    pathType = it->second;
+                                }
+                            }
                             break;
                         case FILE_ACTION_RENAMED_OLD_NAME:
-                            // 存储重命名事件的旧路径信息
+                            pathType = IsDirectory(eventPath) ? PathType::DIRECTORY : PathType::FILE;
+                            {
+                                std::lock_guard<std::mutex> lock(m_mutex);
+                                std::unordered_map<std::string, PathType>::iterator it = m_knownPathTypes.find(eventPath);
+                                if (it != m_knownPathTypes.end()) {
+                                    pathType = it->second;
+                                    m_knownPathTypes.erase(it);
+                                }
+                            }
                             m_renameInfo.oldPath = eventPath;
                             m_renameInfo.oldPathType = pathType;
                             break;
                         case FILE_ACTION_RENAMED_NEW_NAME:
-                            // 创建重命名事件
                             eventType = EventType::kRename;
-                            // 调用回调函数
+                            pathType = m_renameInfo.oldPathType;
+                            if (pathType == PathType::DIRECTORY || IsDirectory(eventPath)) {
+                                pathType = PathType::DIRECTORY;
+                            }
+                            {
+                                std::lock_guard<std::mutex> lock(m_mutex);
+                                m_knownPathTypes[eventPath] = pathType;
+                            }
                             if (m_callback) {
                                 FileEvent fileEvent(eventType, eventPath, pathType, m_renameInfo.oldPath, m_renameInfo.oldPathType);
                                 m_callback(fileEvent);
                             }
-                            // 清空重命名信息
                             m_renameInfo.oldPath = "";
                             m_renameInfo.oldPathType = PathType::FILE;
-                            continue; // 跳过后续的事件处理，因为已经处理了
-                            break;
+                            continue;
                     }
 
-                    // 创建 FileEvent 对象
                     FileEvent fileEvent(eventType, eventPath, pathType);
 
-                    // 调用回调函数
                     if (m_callback) {
                         m_callback(fileEvent);
                     }

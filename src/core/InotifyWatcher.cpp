@@ -20,12 +20,12 @@ namespace filewatch {
 class InotifyWatcher : public PlatformWatcher {
 private:
     int m_inotifyFd;
-    std::unordered_map<int, std::string> m_watchMap; // watch descriptor -> path
-    std::unordered_map<std::string, int> m_pathWatchMap; // path -> watch descriptor
-    std::unordered_map<int, bool> m_watchRecursive; // watch descriptor -> recursive
-    std::atomic<bool> m_running;
-    std::function<void(const FileEvent&)> m_callback;
-    std::mutex m_mutex;
+    std::unordered_map<int, std::string>    m_watchMap;         // watch descriptor -> path
+    std::unordered_map<std::string, int>    m_pathWatchMap;     // path -> watch descriptor
+    std::unordered_map<int, bool>           m_watchRecursive;   // watch descriptor -> recursive
+    std::atomic<bool>                       m_running;
+    std::function<void(const FileEvent&)>   m_callback;
+    std::mutex                              m_mutex;
 
     // 用于存储重命名事件的旧路径信息
     struct RenameInfo {
@@ -54,8 +54,10 @@ public:
             return false;
         }
 
+        // TODO 可以优化为先检查路径是否已被监控，避免重复添加。
+
         int wd = inotify_add_watch(m_inotifyFd, path.c_str(), 
-            IN_CREATE | IN_CLOSE_WRITE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO);
+            IN_CREATE | IN_CLOSE_WRITE | IN_DELETE | IN_DELETE_SELF | IN_MOVED_FROM | IN_MOVED_TO);
         if (wd == -1) {
             return false;
         }
@@ -118,13 +120,14 @@ private:
         return m_pathWatchMap.find(path) != m_pathWatchMap.end();
     }
 
+    // TODO 目录监控失败时，应该有错误反馈机制，目前是直接忽略了。
     void addDirectoryWatch(const std::string& path, bool recursive) {
         if (isPathWatched(path)) {
             return;
         }
 
         int wd = inotify_add_watch(m_inotifyFd, path.c_str(),
-            IN_CREATE | IN_CLOSE_WRITE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO);
+            IN_CREATE | IN_CLOSE_WRITE | IN_DELETE | IN_DELETE_SELF | IN_MOVED_FROM | IN_MOVED_TO);
         if (wd == -1) {
             return;
         }
@@ -214,7 +217,7 @@ private:
             std::string childPath = path + "/" + entry->d_name;
             struct stat statbuf;
             if (stat(childPath.c_str(), &statbuf) == 0 && S_ISDIR(statbuf.st_mode)) {
-                // 递归处理子目录（函数内部会为子目录本身加 watch）
+                // 递归处理子目录 (函数内部会为子目录本身加 watch)
                 addRecursiveWatches(childPath, recursive);
             }
         }
@@ -260,7 +263,7 @@ private:
         } else if (event->mask & IN_CLOSE_WRITE) {
             // 只有文件保存后才通知 MODIFY
             fileEvent = FileEvent(EventType::kModify, path, pathType);
-        } else if (event->mask & IN_DELETE) {
+        } else if (event->mask & (IN_DELETE | IN_DELETE_SELF)) {
             fileEvent = FileEvent(EventType::kDelete, path, pathType);
         } else if (event->mask & IN_MOVED_FROM) {
             // 存储重命名事件的旧路径信息

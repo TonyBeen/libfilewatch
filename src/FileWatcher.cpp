@@ -117,10 +117,10 @@ namespace errc {
         static watcher_error_category instance;
         return instance;
     }
-}
 
-std::error_code make_error_code(errc::watcher_errc e) noexcept {
-    return std::error_code(static_cast<int>(e), errc::watcher_category());
+    std::error_code make_error_code(watcher_errc e) noexcept {
+        return std::error_code(static_cast<int>(e), watcher_category());
+    }
 }
 
 

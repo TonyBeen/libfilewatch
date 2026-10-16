@@ -43,6 +43,11 @@ enum watcher_errc {
      * 获取错误类别单例
      */
     const watcher_error_category& watcher_category() noexcept;
+
+    /**
+     * 创建错误码（用于 ADL）
+     */
+    std::error_code make_error_code(watcher_errc e) noexcept;
 }
 
 /**
@@ -170,7 +175,7 @@ namespace std {
 }
 
 namespace filewatch {
-    std::error_code make_error_code(errc::watcher_errc e) noexcept;
+    using errc::make_error_code;
 }
 
 #endif // FILEWATCH_FILEWATCHER_H
