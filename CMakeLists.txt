@@ -77,6 +77,7 @@ install(FILES
 install(FILES
     include/filewatch/Event.h
     include/filewatch/FileWatcher.h
+    include/filewatch/Timer.h
     include/filewatch/LinuxBackend.h
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/filewatch)
 

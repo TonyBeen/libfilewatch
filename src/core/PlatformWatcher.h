@@ -15,6 +15,12 @@ public:
     virtual bool removeWatch(const std::string& path) = 0;
     virtual bool start() = 0;
     virtual void stop() = 0;
+    virtual void wakeup() {}
+    virtual void setTimerHandlers(std::function<int64_t()> nextTimeoutProvider,
+                                  std::function<void()> expiryHandler) {
+        (void)nextTimeoutProvider;
+        (void)expiryHandler;
+    }
     virtual ~PlatformWatcher() = default;
 };
 

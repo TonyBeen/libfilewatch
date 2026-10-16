@@ -12,7 +12,7 @@
 #include <fstream>
 #include <cstdlib>
 
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
 #include <unistd.h>
 #include <sys/stat.h>
 #endif
@@ -290,18 +290,18 @@ TEST_CASE("FileWatcher class tests", "[FileWatcher]") {
         REQUIRE(started == true);
     }
 
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
     SECTION("Recursive watch captures events in newly created subdirectory") {
         char tmpTemplate[] = "/tmp/filewatch_recursive_ut_XXXXXX";
         char* created = mkdtemp(tmpTemplate);
         REQUIRE(created != nullptr);
-        std::string baseDir(created);
+        std::string baseDir = filewatch::utils::PathUtils::getAbsolutePath(created);
         std::string firstLevel = baseDir + "/fw";
         std::string nestedDir = firstLevel + "/inner";
         std::string file1 = nestedDir + "/a.txt";
         std::string file2 = nestedDir + "/a2.txt";
 
-        filewatch::FileWatcher watcher(filewatch::LinuxBackend::INOTIFY);
+        filewatch::FileWatcher watcher;
         std::vector<filewatch::FileEvent> captured;
         std::mutex capturedMutex;
 
@@ -390,7 +390,7 @@ TEST_CASE("FileWatcher class tests", "[FileWatcher]") {
         char tmpTemplate[] = "/tmp/filewatch_copytree_ut_XXXXXX";
         char* created = mkdtemp(tmpTemplate);
         REQUIRE(created != nullptr);
-        std::string tmpRoot(created);
+        std::string tmpRoot = filewatch::utils::PathUtils::getAbsolutePath(created);
         std::string watchedRoot = tmpRoot + "/watched";
         std::string seedRoot = tmpRoot + "/seed";
         std::string seedNested = seedRoot + "/nested";
@@ -410,7 +410,7 @@ TEST_CASE("FileWatcher class tests", "[FileWatcher]") {
             ofs << "inner";
         }
 
-        filewatch::FileWatcher watcher(filewatch::LinuxBackend::INOTIFY);
+        filewatch::FileWatcher watcher;
         std::vector<filewatch::FileEvent> captured;
         std::mutex capturedMutex;
 
@@ -466,7 +466,7 @@ TEST_CASE("FileWatcher class tests", "[FileWatcher]") {
         char tmpTemplate[] = "/tmp/filewatch_single_ut_XXXXXX";
         char* created = mkdtemp(tmpTemplate);
         REQUIRE(created != nullptr);
-        std::string baseDir(created);
+        std::string baseDir = filewatch::utils::PathUtils::getAbsolutePath(created);
         std::string targetFile = baseDir + "/target.txt";
 
         // 先创建文件
@@ -475,7 +475,7 @@ TEST_CASE("FileWatcher class tests", "[FileWatcher]") {
             ofs << "initial";
         }
 
-        filewatch::FileWatcher watcher(filewatch::LinuxBackend::INOTIFY);
+        filewatch::FileWatcher watcher;
         std::vector<filewatch::FileEvent> captured;
         std::mutex capturedMutex;
 
@@ -530,11 +530,11 @@ TEST_CASE("FileWatcher class tests", "[FileWatcher]") {
         char tmpTemplate[] = "/tmp/filewatch_filter_ut_XXXXXX";
         char* created = mkdtemp(tmpTemplate);
         REQUIRE(created != nullptr);
-        std::string baseDir(created);
+        std::string baseDir = filewatch::utils::PathUtils::getAbsolutePath(created);
         std::string logFile = baseDir + "/app.log";
         std::string tmpFile = baseDir + "/app.tmp";
 
-        filewatch::FileWatcher watcher(filewatch::LinuxBackend::INOTIFY);
+        filewatch::FileWatcher watcher;
         filewatch::FileWatcher::Filter filter;
         filter.setExtensions({".log"});
         watcher.setFilter(filter);
@@ -594,7 +594,7 @@ TEST_CASE("FileWatcher class tests", "[FileWatcher]") {
         char tmpTemplate[] = "/tmp/filewatch_debounce_ut_XXXXXX";
         char* created = mkdtemp(tmpTemplate);
         REQUIRE(created != nullptr);
-        std::string baseDir(created);
+        std::string baseDir = filewatch::utils::PathUtils::getAbsolutePath(created);
         std::string testFile = baseDir + "/burst.txt";
 
         {
@@ -602,7 +602,7 @@ TEST_CASE("FileWatcher class tests", "[FileWatcher]") {
             ofs << "init";
         }
 
-        filewatch::FileWatcher watcher(filewatch::LinuxBackend::INOTIFY);
+        filewatch::FileWatcher watcher;
         std::atomic<int> modifyCount(0);
 
         bool added = watcher.addWatch(baseDir, false, [&modifyCount, &testFile](const filewatch::FileEvent& event) {
@@ -645,14 +645,14 @@ TEST_CASE("FileWatcher class tests", "[FileWatcher]") {
         char tmpTemplate[] = "/tmp/filewatch_nonrec_ut_XXXXXX";
         char* created = mkdtemp(tmpTemplate);
         REQUIRE(created != nullptr);
-        std::string baseDir(created);
+        std::string baseDir = filewatch::utils::PathUtils::getAbsolutePath(created);
         std::string subDir = baseDir + "/subdir";
         std::string rootFile = baseDir + "/root.txt";
         std::string subFile = subDir + "/inner.txt";
 
         REQUIRE(::mkdir(subDir.c_str(), 0755) == 0);
 
-        filewatch::FileWatcher watcher(filewatch::LinuxBackend::INOTIFY);
+        filewatch::FileWatcher watcher;
         std::vector<filewatch::FileEvent> captured;
         std::mutex capturedMutex;
 
@@ -711,11 +711,11 @@ TEST_CASE("FileWatcher class tests", "[FileWatcher]") {
         char tmpTemplate[] = "/tmp/filewatch_regex_ut_XXXXXX";
         char* created = mkdtemp(tmpTemplate);
         REQUIRE(created != nullptr);
-        std::string baseDir(created);
+        std::string baseDir = filewatch::utils::PathUtils::getAbsolutePath(created);
         std::string matchFile = baseDir + "/important.log";
         std::string ignoreFile = baseDir + "/ignore.txt";
 
-        filewatch::FileWatcher watcher(filewatch::LinuxBackend::INOTIFY);
+        filewatch::FileWatcher watcher;
         std::vector<filewatch::FileEvent> captured;
         std::mutex capturedMutex;
 
@@ -772,11 +772,11 @@ TEST_CASE("FileWatcher class tests", "[FileWatcher]") {
         char tmpTemplate[] = "/tmp/filewatch_rmwatch_ut_XXXXXX";
         char* created = mkdtemp(tmpTemplate);
         REQUIRE(created != nullptr);
-        std::string baseDir(created);
+        std::string baseDir = filewatch::utils::PathUtils::getAbsolutePath(created);
         std::string fileBefore = baseDir + "/before.txt";
         std::string fileAfter = baseDir + "/after.txt";
 
-        filewatch::FileWatcher watcher(filewatch::LinuxBackend::INOTIFY);
+        filewatch::FileWatcher watcher;
         std::vector<filewatch::FileEvent> captured;
         std::mutex capturedMutex;
 
@@ -833,6 +833,143 @@ TEST_CASE("FileWatcher class tests", "[FileWatcher]") {
 
         ::unlink(fileBefore.c_str());
         ::unlink(fileAfter.c_str());
+        ::rmdir(baseDir.c_str());
+    }
+
+    SECTION("Multiple watched directories callback isolation") {
+        char tmpTemplateA[] = "/tmp/filewatch_multia_ut_XXXXXX";
+        char tmpTemplateB[] = "/tmp/filewatch_multib_ut_XXXXXX";
+        char* createdA = mkdtemp(tmpTemplateA);
+        char* createdB = mkdtemp(tmpTemplateB);
+        REQUIRE(createdA != nullptr);
+        REQUIRE(createdB != nullptr);
+        std::string baseDirA = filewatch::utils::PathUtils::getAbsolutePath(createdA);
+        std::string baseDirB = filewatch::utils::PathUtils::getAbsolutePath(createdB);
+        std::string fileA = baseDirA + "/file_a.txt";
+        std::string fileB = baseDirB + "/file_b.txt";
+
+        filewatch::FileWatcher watcher;
+        std::vector<std::string> capturedA;
+        std::vector<std::string> capturedB;
+        std::mutex mutexA;
+        std::mutex mutexB;
+
+        bool addedA = watcher.addWatch(baseDirA, false, [&capturedA, &mutexA](const filewatch::FileEvent& event) {
+            std::lock_guard<std::mutex> lock(mutexA);
+            capturedA.push_back(event.getPath());
+        });
+        bool addedB = watcher.addWatch(baseDirB, false, [&capturedB, &mutexB](const filewatch::FileEvent& event) {
+            std::lock_guard<std::mutex> lock(mutexB);
+            capturedB.push_back(event.getPath());
+        });
+        REQUIRE(addedA == true);
+        REQUIRE(addedB == true);
+
+        std::atomic<bool> started(false);
+        std::thread startThread([&watcher, &started]() {
+            started = watcher.start();
+        });
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+        {
+            std::ofstream ofs(fileA.c_str());
+            ofs << "data a";
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+        {
+            std::ofstream ofs(fileB.c_str());
+            ofs << "data b";
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+        watcher.stop();
+        startThread.join();
+        REQUIRE(started == true);
+
+        bool aSawA = false;
+        bool aSawB = false;
+        {
+            std::lock_guard<std::mutex> lock(mutexA);
+            for (const auto& p : capturedA) {
+                if (p == fileA) aSawA = true;
+                if (p == fileB) aSawB = true;
+            }
+        }
+
+        bool bSawA = false;
+        bool bSawB = false;
+        {
+            std::lock_guard<std::mutex> lock(mutexB);
+            for (const auto& p : capturedB) {
+                if (p == fileA) bSawA = true;
+                if (p == fileB) bSawB = true;
+            }
+        }
+
+        REQUIRE(aSawA == true);
+        REQUIRE(aSawB == false);
+        REQUIRE(bSawA == false);
+        REQUIRE(bSawB == true);
+
+        ::unlink(fileA.c_str());
+        ::unlink(fileB.c_str());
+        ::rmdir(baseDirA.c_str());
+        ::rmdir(baseDirB.c_str());
+    }
+
+    SECTION("Directory rename captures rename event and old path") {
+        char tmpTemplate[] = "/tmp/filewatch_dirrename_ut_XXXXXX";
+        char* created = mkdtemp(tmpTemplate);
+        REQUIRE(created != nullptr);
+        std::string baseDir = filewatch::utils::PathUtils::getAbsolutePath(created);
+        std::string oldSubDir = baseDir + "/dir_old";
+        std::string newSubDir = baseDir + "/dir_new";
+
+        filewatch::FileWatcher watcher;
+        std::vector<filewatch::FileEvent> captured;
+        std::mutex capturedMutex;
+
+        bool added = watcher.addWatch(baseDir, true, [&captured, &capturedMutex](const filewatch::FileEvent& event) {
+            std::lock_guard<std::mutex> lock(capturedMutex);
+            captured.push_back(event);
+        });
+        REQUIRE(added == true);
+
+        std::atomic<bool> started(false);
+        std::thread startThread([&watcher, &started]() {
+            started = watcher.start();
+        });
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+        REQUIRE(::mkdir(oldSubDir.c_str(), 0755) == 0);
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+        REQUIRE(::rename(oldSubDir.c_str(), newSubDir.c_str()) == 0);
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+        watcher.stop();
+        startThread.join();
+        REQUIRE(started == true);
+
+        bool sawDirRename = false;
+        {
+            std::lock_guard<std::mutex> lock(capturedMutex);
+            for (const auto& e : captured) {
+                if (e.getType() == filewatch::EventType::kRename &&
+                    e.getPathType() == filewatch::PathType::DIRECTORY &&
+                    e.getPath() == newSubDir &&
+                    e.getOldPath() == oldSubDir) {
+                    sawDirRename = true;
+                }
+            }
+        }
+
+        REQUIRE(sawDirRename == true);
+
+        ::rmdir(newSubDir.c_str());
         ::rmdir(baseDir.c_str());
     }
 #endif
@@ -947,3 +1084,294 @@ TEST_CASE("Error category and error code tests", "[Error]") {
         REQUIRE(ec.message() == "path does not exist");
     }
 }
+
+// 测试定时器管理（Timer，基于 libevent 模式，外部持有对象，主线程无锁回调）
+TEST_CASE("Timer class and management tests", "[Timer]") {
+    SECTION("Zero timers case: watcher starts, does not block indefinitely, stops cleanly") {
+        filewatch::FileWatcher watcher;
+        std::atomic<bool> started(false);
+        auto t0 = std::chrono::steady_clock::now();
+
+        std::thread startThread([&watcher, &started]() {
+            started = watcher.start();
+        });
+
+        // 验证 0 定时器下不会崩溃，等待 200ms 后正常 stop
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        watcher.stop();
+        startThread.join();
+
+        auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        REQUIRE(started == true);
+        REQUIRE(elapsedMs < 2000); // 必须在合理时间内退出，不能永久阻塞
+    }
+
+    SECTION("One-shot timer triggers once accurately and on main thread") {
+        filewatch::FileWatcher watcher;
+        std::thread::id mainThreadId;
+        std::atomic<int> triggerCount(0);
+        std::thread::id callbackThreadId;
+
+        // 外部栈持有 Timer 对象，零动态分配
+        filewatch::Timer timer([&triggerCount, &callbackThreadId](filewatch::Timer& t) {
+            triggerCount++;
+            callbackThreadId = std::this_thread::get_id();
+            REQUIRE(t.isActive() == false); // 单次定时器触发时已被置为 inactive
+        });
+
+        REQUIRE(timer.isActive() == false);
+        bool added = watcher.addTimer(timer, 100);
+        REQUIRE(added == true);
+        REQUIRE(timer.isActive() == true);
+        REQUIRE(timer.getIntervalMs() == 100);
+        REQUIRE(timer.isRepeating() == false);
+
+        std::thread startThread([&watcher, &mainThreadId]() {
+            mainThreadId = std::this_thread::get_id();
+            watcher.start();
+        });
+
+        // 等待足够时间触发单次定时器
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+
+        watcher.stop();
+        startThread.join();
+
+        REQUIRE(triggerCount == 1);
+        REQUIRE(callbackThreadId == mainThreadId); // 回调 100% 在主线程执行
+        REQUIRE(timer.isActive() == false);
+    }
+
+    SECTION("Repeating timer triggers multiple times periodically") {
+        filewatch::FileWatcher watcher;
+        std::atomic<int> triggerCount(0);
+
+        // 外部持有周期性定时器（repeating = true）
+        filewatch::Timer timer([&triggerCount]() {
+            triggerCount++;
+        }, true);
+
+        REQUIRE(timer.isRepeating() == true);
+        watcher.addTimer(timer, 80);
+
+        std::thread startThread([&watcher]() {
+            watcher.start();
+        });
+
+        // 运行 280ms，应该触发 3 次左右 (80ms, 160ms, 240ms)
+        std::this_thread::sleep_for(std::chrono::milliseconds(280));
+
+        watcher.stop();
+        startThread.join();
+
+        REQUIRE(triggerCount >= 2);
+        REQUIRE(triggerCount <= 5);
+    }
+
+    SECTION("Removing timer before expiry prevents callback execution") {
+        filewatch::FileWatcher watcher;
+        std::atomic<int> triggerCount(0);
+
+        filewatch::Timer timer([&triggerCount]() {
+            triggerCount++;
+        });
+
+        watcher.addTimer(timer, 250);
+        REQUIRE(timer.isActive() == true);
+
+        std::thread startThread([&watcher]() {
+            watcher.start();
+        });
+
+        // 50ms 时提前移除定时器
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        bool removed = watcher.removeTimer(timer);
+        REQUIRE(removed == true);
+        REQUIRE(timer.isActive() == false);
+
+        // 再等待 300ms，确保超出原本的 250ms
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+        watcher.stop();
+        startThread.join();
+
+        REQUIRE(triggerCount == 0); // 取消成功，绝对未被触发
+    }
+
+    SECTION("Callback adding another timer does not deadlock and executes properly") {
+        filewatch::FileWatcher watcher;
+        std::atomic<int> step(0);
+
+        filewatch::Timer timerB([&step]() {
+            step = 2;
+        });
+
+        filewatch::Timer timerA([&watcher, &timerB, &step]() {
+            step = 1;
+            // 在主线程回调内部添加新的定时器 B
+            watcher.addTimer(timerB, 60);
+        });
+
+        watcher.addTimer(timerA, 60);
+
+        std::thread startThread([&watcher]() {
+            watcher.start();
+        });
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+
+        watcher.stop();
+        startThread.join();
+
+        REQUIRE(step == 2);
+    }
+
+    SECTION("Timer object reuse: can be re-added after expiration without allocation") {
+        filewatch::FileWatcher watcher;
+        std::atomic<int> triggerCount(0);
+
+        filewatch::Timer timer([&triggerCount]() {
+            triggerCount++;
+        });
+
+        watcher.addTimer(timer, 60);
+
+        std::thread startThread([&watcher]() {
+            watcher.start();
+        });
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(120));
+        REQUIRE(triggerCount == 1);
+        REQUIRE(timer.isActive() == false);
+
+        // 复用同一个 Timer 实体重新注册
+        watcher.addTimer(timer, 60);
+        REQUIRE(timer.isActive() == true);
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(120));
+        REQUIRE(triggerCount == 2);
+
+        watcher.stop();
+        startThread.join();
+    }
+
+    SECTION("Multiple timers execute in correct order based on expiration") {
+        filewatch::FileWatcher watcher;
+        std::vector<int> order;
+
+        filewatch::Timer timer1([&order]() {
+            order.push_back(1);
+        });
+        filewatch::Timer timer2([&order]() {
+            order.push_back(2);
+        });
+        filewatch::Timer timer3([&order]() {
+            order.push_back(3);
+        });
+
+        // 乱序添加，但按时间先后应该为 1 (50ms) -> 2 (120ms) -> 3 (200ms)
+        watcher.addTimer(timer3, 200);
+        watcher.addTimer(timer1, 50);
+        watcher.addTimer(timer2, 120);
+
+        std::thread startThread([&watcher]() {
+            watcher.start();
+        });
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+        watcher.stop();
+        startThread.join();
+
+        REQUIRE(order.size() == 3);
+        if (order.size() == 3) {
+            REQUIRE(order[0] == 1);
+            REQUIRE(order[1] == 2);
+            REQUIRE(order[2] == 3);
+        }
+    }
+
+    SECTION("Callback cancelling repeating timer itself stops further triggers") {
+        filewatch::FileWatcher watcher;
+        std::atomic<int> triggerCount(0);
+
+        filewatch::Timer timer;
+        timer.setRepeating(true);
+        timer.setCallback([&watcher, &timer, &triggerCount](filewatch::Timer& t) {
+            triggerCount++;
+            if (triggerCount == 2) {
+                // 在触发第 2 次时在回调内取消自身
+                watcher.removeTimer(t);
+            }
+        });
+
+        watcher.addTimer(timer, 60);
+
+        std::thread startThread([&watcher]() {
+            watcher.start();
+        });
+
+        // 运行 250ms，原本应该触发约 4 次，但因在第 2 次取消，triggerCount 必须恒为 2
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+
+        watcher.stop();
+        startThread.join();
+
+        REQUIRE(triggerCount == 2);
+        REQUIRE(timer.isActive() == false);
+    }
+
+    SECTION("Callback cancelling another pending timer prevents it from firing") {
+        filewatch::FileWatcher watcher;
+        std::atomic<bool> timerBExecuted(false);
+
+        filewatch::Timer timerB([&timerBExecuted]() {
+            timerBExecuted = true;
+        });
+
+        filewatch::Timer timerA([&watcher, &timerB]() {
+            // A 到期时立即取消 B
+            watcher.removeTimer(timerB);
+        });
+
+        // A 设为 60ms，B 设为 120ms
+        watcher.addTimer(timerA, 60);
+        watcher.addTimer(timerB, 120);
+
+        std::thread startThread([&watcher]() {
+            watcher.start();
+        });
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+        watcher.stop();
+        startThread.join();
+
+        REQUIRE(timerBExecuted == false);
+        REQUIRE(timerB.isActive() == false);
+    }
+
+    SECTION("Timer move semantics and state transfer") {
+        bool called = false;
+        filewatch::Timer t1([&called]() {
+            called = true;
+        }, true);
+        t1.setRepeating(true);
+
+        REQUIRE(t1.isRepeating() == true);
+        REQUIRE(t1.isActive() == false);
+
+        // 移动构造
+        filewatch::Timer t2(std::move(t1));
+        REQUIRE(t2.isRepeating() == true);
+        REQUIRE(t1.isActive() == false);
+
+        // 移动赋值
+        filewatch::Timer t3;
+        t3 = std::move(t2);
+        REQUIRE(t3.isRepeating() == true);
+        REQUIRE(t2.isActive() == false);
+    }
+}
+
+

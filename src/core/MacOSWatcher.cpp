@@ -14,55 +14,68 @@
 
 #ifdef __APPLE__
 #include <CoreServices/CoreServices.h>
+#include <sys/event.h>
+#include <sys/time.h>
+#include <sys/socket.h>
+#include <sys/select.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 namespace filewatch {
 
 class MacOSWatcher : public PlatformWatcher {
 private:
-    std::vector<std::string> m_watchList;
-    std::atomic<bool> m_running;
-    std::function<void(const FileEvent&)> m_callback;
-    std::mutex m_mutex;
+    // 递归监控列表（使用 FSEvents）
+    std::vector<std::string> m_fseventsWatchList;
     FSEventStreamRef m_eventStream;
     std::unordered_set<std::string> m_knownPaths;
     std::unordered_map<std::string, PathType> m_knownPathTypes;
     std::mutex m_knownPathsMutex;
 
-    // 事件过滤器
-    struct Filter {
-        std::vector<EventType> eventTypes;
-        std::vector<std::string> extensions;
-
-        bool passes(const FileEvent& event) const {
-            // 检查事件类型
-            if (!eventTypes.empty()) {
-                if (std::find(eventTypes.begin(), eventTypes.end(), event.getType()) == eventTypes.end()) {
-                    return false;
-                }
-            }
-
-            // 检查文件扩展名
-            if (!extensions.empty() && event.getPathType() == PathType::FILE) {
-                const std::string& path = event.getPath();
-                size_t dotPos = path.rfind('.');
-                if (dotPos != std::string::npos) {
-                    std::string extension = path.substr(dotPos);
-                    if (std::find(extensions.begin(), extensions.end(), extension) == extensions.end()) {
-                        return false;
-                    }
-                } else {
-                    return false; // 没有扩展名的文件
-                }
-            }
-
-            return true;
-        }
+    // 非递归监控项（使用 kqueue 独占线程）
+    struct DirectChildSnapshot {
+        PathType type;
+        time_t mtime;
+        off_t size;
     };
-    Filter m_filter;
+
+    struct KqItem {
+        std::string path;
+        int fd;
+        bool isDirectory;
+        std::unordered_map<std::string, DirectChildSnapshot> children;
+        std::unordered_map<std::string, int> childFileFds; // 直接子文件的 fd，用于监听修改
+    };
+
+    int m_kqFd;
+    std::unordered_map<std::string, std::shared_ptr<KqItem> > m_kqWatches;
+    std::unordered_map<int, std::shared_ptr<KqItem> > m_kqFdMap; // 包含主 fd 和直接子文件 fd
+    std::unordered_map<int, std::string> m_childFdToPath; // 子文件 fd 映射到路径
+    std::mutex m_kqMutex;
+    std::thread m_kqThread;
+    std::atomic<bool> m_kqRunning;
+
+    // Local Unix Socket 用于工作线程向主线程同步并唤醒
+    int m_spFds[2]; // [0]: 主线程读, [1]: 工作线程写
+    std::vector<FileEvent> m_pendingEvents;
+    std::mutex m_eventQueueMutex;
+
+    std::function<int64_t()> m_nextTimeoutProvider;
+    std::function<void()> m_timerExpiryHandler;
+
+    std::atomic<bool> m_running;
+    std::function<void(const FileEvent&)> m_callback;
+    std::mutex m_mutex;
 
 public:
     explicit MacOSWatcher(std::function<void(const FileEvent&)> callback)
-        : m_running(false), m_callback(callback), m_eventStream(nullptr) {
+        : m_eventStream(nullptr),
+          m_kqFd(-1),
+          m_kqRunning(false),
+          m_running(false),
+          m_callback(callback) {
+        m_spFds[0] = -1;
+        m_spFds[1] = -1;
     }
 
     ~MacOSWatcher() {
@@ -71,32 +84,57 @@ public:
         }
     }
 
+    void wakeup() override {
+        if (m_spFds[1] != -1) {
+            char sig = 1;
+            (void)write(m_spFds[1], &sig, 1);
+        }
+    }
+
+    void setTimerHandlers(std::function<int64_t()> nextTimeoutProvider,
+                          std::function<void()> expiryHandler) override {
+        m_nextTimeoutProvider = std::move(nextTimeoutProvider);
+        m_timerExpiryHandler = std::move(expiryHandler);
+    }
+
     bool addWatch(const std::string& path, bool recursive) override {
-        // 检查路径是否存在
         struct stat stat_buf;
         if (stat(path.c_str(), &stat_buf) != 0) {
             return false; // 路径不存在
         }
 
-        // 检查是否有读权限
         if (access(path.c_str(), R_OK) != 0) {
             return false; // 没有读权限
         }
 
+        const bool isDir = S_ISDIR(stat_buf.st_mode);
+
         std::lock_guard<std::mutex> lock(m_mutex);
-        m_watchList.push_back(path);
-        rememberExistingPathTree(path);
+        if (recursive && isDir) {
+            // 递归目录：使用 FSEvents 引擎
+            m_fseventsWatchList.push_back(path);
+            rememberExistingPathTree(path);
+        } else {
+            // 非递归目录或单文件：使用 kqueue 引擎
+            if (!addKqueueItem(path, isDir)) {
+                return false;
+            }
+        }
         return true;
     }
 
     bool removeWatch(const std::string& path) override {
         std::lock_guard<std::mutex> lock(m_mutex);
-        auto it = std::find(m_watchList.begin(), m_watchList.end(), path);
-        if (it != m_watchList.end()) {
-            m_watchList.erase(it);
+
+        // 先尝试从 FSEvents 列表中移除
+        auto itFs = std::find(m_fseventsWatchList.begin(), m_fseventsWatchList.end(), path);
+        if (itFs != m_fseventsWatchList.end()) {
+            m_fseventsWatchList.erase(itFs);
             return true;
         }
-        return false;
+
+        // 再尝试从 kqueue 列表中移除
+        return removeKqueueItem(path);
     }
 
     bool start() override {
@@ -104,8 +142,23 @@ public:
             return false;
         }
 
+        // 创建用于跨线程同步通知的 local unix socketpair
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, m_spFds) != 0) {
+            return false;
+        }
+
+        // 设置非阻塞
+        fcntl(m_spFds[0], F_SETFL, O_NONBLOCK);
+        fcntl(m_spFds[1], F_SETFL, O_NONBLOCK);
+
         m_running = true;
+
+        // 启动 kqueue 独占线程
+        startKqueueThread();
+
+        // 进入主事件循环（主线程）
         watchLoop();
+
         return true;
     }
 
@@ -116,16 +169,413 @@ public:
 
         m_running = false;
 
-        // 停止 FSEvents 流
-        if (m_eventStream) {
-            FSEventStreamStop(m_eventStream);
-            FSEventStreamInvalidate(m_eventStream);
-            FSEventStreamRelease(m_eventStream);
-            m_eventStream = nullptr;
+        // 1. 停止 kqueue 线程
+        stopKqueueThread();
+
+        // 2. 停止 FSEvents 流
+        stopFSEvents();
+
+        // 3. 唤醒主线程退出 select
+        if (m_spFds[1] != -1) {
+            char sig = 1;
+            (void)write(m_spFds[1], &sig, 1);
+        }
+
+        // 4. 关闭 socketpair
+        if (m_spFds[0] != -1) {
+            close(m_spFds[0]);
+            m_spFds[0] = -1;
+        }
+        if (m_spFds[1] != -1) {
+            close(m_spFds[1]);
+            m_spFds[1] = -1;
         }
     }
 
 private:
+    void pushEventToMainThread(const FileEvent& event) {
+        {
+            std::lock_guard<std::mutex> lock(m_eventQueueMutex);
+            m_pendingEvents.push_back(event);
+        }
+        if (m_spFds[1] != -1) {
+            char sig = 1;
+            (void)write(m_spFds[1], &sig, 1);
+        }
+    }
+
+    void pushEventsToMainThread(const std::vector<FileEvent>& events) {
+        if (events.empty()) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(m_eventQueueMutex);
+            m_pendingEvents.insert(m_pendingEvents.end(), events.begin(), events.end());
+        }
+        if (m_spFds[1] != -1) {
+            char sig = 1;
+            (void)write(m_spFds[1], &sig, 1);
+        }
+    }
+
+    void dispatchPendingEventsOnMainThread() {
+        std::vector<FileEvent> events;
+        {
+            std::lock_guard<std::mutex> lock(m_eventQueueMutex);
+            events.swap(m_pendingEvents);
+        }
+        for (const auto& ev : events) {
+            if (m_callback) {
+                m_callback(ev);
+            }
+        }
+    }
+
+    // ==========================================
+    // kqueue 子引擎实现（专管非递归目录及单文件）
+    // ==========================================
+    static std::unordered_map<std::string, DirectChildSnapshot> scanDirectChildren(const std::string& dirPath) {
+        std::unordered_map<std::string, DirectChildSnapshot> snapshot;
+        DIR* dir = opendir(dirPath.c_str());
+        if (!dir) {
+            return snapshot;
+        }
+
+        struct dirent* entry;
+        while ((entry = readdir(dir)) != nullptr) {
+            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+                continue;
+            }
+            std::string childPath = dirPath;
+            if (!childPath.empty() && childPath[childPath.size() - 1] != '/') {
+                childPath += "/";
+            }
+            childPath += entry->d_name;
+
+            struct stat st;
+            if (lstat(childPath.c_str(), &st) == 0) {
+                DirectChildSnapshot snap;
+                snap.type = S_ISDIR(st.st_mode) ? PathType::DIRECTORY : PathType::FILE;
+                snap.mtime = st.st_mtime;
+                snap.size = st.st_size;
+                snapshot[childPath] = snap;
+            }
+        }
+        closedir(dir);
+        return snapshot;
+    }
+
+    void syncDirectChildFileWatches(const std::shared_ptr<KqItem>& item) {
+        if (!item->isDirectory || m_kqFd < 0) {
+            return;
+        }
+
+        // 1. 打开新直接子文件的监听（仅直接子文件，绝不递归打开子目录）
+        for (const auto& pair : item->children) {
+            const std::string& childPath = pair.first;
+            if (pair.second.type == PathType::FILE) {
+                if (item->childFileFds.find(childPath) == item->childFileFds.end()) {
+                    int cfd = open(childPath.c_str(), O_RDONLY | O_EVTONLY);
+                    if (cfd >= 0) {
+                        item->childFileFds[childPath] = cfd;
+                        m_kqFdMap[cfd] = item;
+                        m_childFdToPath[cfd] = childPath;
+
+                        struct kevent change;
+                        EV_SET(&change, cfd, EVFILT_VNODE, EV_ADD | EV_ENABLE | EV_CLEAR,
+                               NOTE_WRITE | NOTE_EXTEND | NOTE_ATTRIB, 0, item.get());
+                        kevent(m_kqFd, &change, 1, nullptr, 0, nullptr);
+                    }
+                }
+            }
+        }
+
+        // 2. 清理已不存在的子文件监听
+        auto it = item->childFileFds.begin();
+        while (it != item->childFileFds.end()) {
+            if (item->children.find(it->first) == item->children.end()) {
+                int cfd = it->second;
+                if (cfd >= 0) {
+                    struct kevent change;
+                    EV_SET(&change, cfd, EVFILT_VNODE, EV_DELETE, 0, 0, nullptr);
+                    kevent(m_kqFd, &change, 1, nullptr, 0, nullptr);
+                    close(cfd);
+                    m_kqFdMap.erase(cfd);
+                    m_childFdToPath.erase(cfd);
+                }
+                it = item->childFileFds.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    bool addKqueueItem(const std::string& path, bool isDirectory) {
+        int fd = open(path.c_str(), O_RDONLY | O_EVTONLY);
+        if (fd < 0) {
+            return false;
+        }
+
+        auto item = std::make_shared<KqItem>();
+        item->path = path;
+        item->fd = fd;
+        item->isDirectory = isDirectory;
+        if (isDirectory) {
+            item->children = scanDirectChildren(path);
+        }
+
+        std::lock_guard<std::mutex> lock(m_kqMutex);
+        m_kqWatches[path] = item;
+        m_kqFdMap[fd] = item;
+
+        if (m_kqFd >= 0) {
+            registerKevent(item);
+            if (isDirectory) {
+                syncDirectChildFileWatches(item);
+            }
+        }
+        return true;
+    }
+
+    bool removeKqueueItem(const std::string& path) {
+        std::lock_guard<std::mutex> lock(m_kqMutex);
+        auto it = m_kqWatches.find(path);
+        if (it == m_kqWatches.end()) {
+            return false;
+        }
+
+        auto item = it->second;
+        // 关闭该目录下的所有子文件 fd
+        for (const auto& cpair : item->childFileFds) {
+            int cfd = cpair.second;
+            if (cfd >= 0) {
+                if (m_kqFd >= 0) {
+                    struct kevent change;
+                    EV_SET(&change, cfd, EVFILT_VNODE, EV_DELETE, 0, 0, nullptr);
+                    kevent(m_kqFd, &change, 1, nullptr, 0, nullptr);
+                }
+                close(cfd);
+                m_kqFdMap.erase(cfd);
+                m_childFdToPath.erase(cfd);
+            }
+        }
+        item->childFileFds.clear();
+
+        // 关闭主 fd
+        if (m_kqFd >= 0 && item->fd >= 0) {
+            struct kevent change;
+            EV_SET(&change, item->fd, EVFILT_VNODE, EV_DELETE, 0, 0, nullptr);
+            kevent(m_kqFd, &change, 1, nullptr, 0, nullptr);
+        }
+        if (item->fd >= 0) {
+            close(item->fd);
+            m_kqFdMap.erase(item->fd);
+            item->fd = -1;
+        }
+        m_kqWatches.erase(it);
+        return true;
+    }
+
+    void registerKevent(const std::shared_ptr<KqItem>& item) {
+        struct kevent change;
+        unsigned int fflags = NOTE_WRITE | NOTE_DELETE | NOTE_RENAME | NOTE_REVOKE;
+        if (!item->isDirectory) {
+            fflags |= NOTE_EXTEND | NOTE_ATTRIB;
+        }
+        EV_SET(&change, item->fd, EVFILT_VNODE, EV_ADD | EV_ENABLE | EV_CLEAR, fflags, 0, item.get());
+        kevent(m_kqFd, &change, 1, nullptr, 0, nullptr);
+    }
+
+    void startKqueueThread() {
+        if (m_kqFd < 0) {
+            m_kqFd = kqueue();
+        }
+        if (m_kqFd < 0) {
+            return;
+        }
+
+        // 注册已添加的项
+        {
+            std::lock_guard<std::mutex> lock(m_kqMutex);
+            for (const auto& pair : m_kqWatches) {
+                registerKevent(pair.second);
+                if (pair.second->isDirectory) {
+                    syncDirectChildFileWatches(pair.second);
+                }
+            }
+        }
+
+        m_kqRunning = true;
+        m_kqThread = std::thread([this]() {
+            kqueueLoop();
+        });
+    }
+
+    void stopKqueueThread() {
+        m_kqRunning = false;
+        if (m_kqThread.joinable()) {
+            m_kqThread.join();
+        }
+
+        std::lock_guard<std::mutex> lock(m_kqMutex);
+        for (const auto& pair : m_kqWatches) {
+            for (const auto& cpair : pair.second->childFileFds) {
+                if (cpair.second >= 0) {
+                    close(cpair.second);
+                }
+            }
+            pair.second->childFileFds.clear();
+            if (pair.second->fd >= 0) {
+                close(pair.second->fd);
+                pair.second->fd = -1;
+            }
+        }
+        m_kqFdMap.clear();
+        m_childFdToPath.clear();
+
+        if (m_kqFd >= 0) {
+            close(m_kqFd);
+            m_kqFd = -1;
+        }
+    }
+
+    void kqueueLoop() {
+        struct kevent events[32];
+        while (m_kqRunning) {
+            struct timespec timeout = { 0, 100000000 }; // 100ms
+            int nev = kevent(m_kqFd, nullptr, 0, events, 32, &timeout);
+            if (nev < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                break;
+            }
+
+            for (int i = 0; i < nev; ++i) {
+                handleKevent(events[i]);
+            }
+        }
+    }
+
+    void handleKevent(const struct kevent& ev) {
+        const int triggeredFd = static_cast<int>(ev.ident);
+        std::shared_ptr<KqItem> item;
+        std::string childFilePath;
+        bool isChildFile = false;
+
+        {
+            std::lock_guard<std::mutex> lock(m_kqMutex);
+            auto itChild = m_childFdToPath.find(triggeredFd);
+            if (itChild != m_childFdToPath.end()) {
+                isChildFile = true;
+                childFilePath = itChild->second;
+            }
+
+            auto it = m_kqFdMap.find(triggeredFd);
+            if (it == m_kqFdMap.end()) {
+                return;
+            }
+            item = it->second;
+        }
+
+        if (!item) {
+            return;
+        }
+
+        std::vector<FileEvent> batch;
+
+        if (isChildFile) {
+            // 直接子文件的内容被修改
+            if (ev.fflags & (NOTE_WRITE | NOTE_EXTEND | NOTE_ATTRIB)) {
+                batch.emplace_back(EventType::kModify, childFilePath, PathType::FILE);
+            }
+        } else if (item->isDirectory) {
+            // 目录自身的子项创建/删除/重命名
+            if (ev.fflags & NOTE_WRITE) {
+                auto newSnapshot = scanDirectChildren(item->path);
+                diffDirectorySnapshot(item, newSnapshot, batch);
+
+                std::lock_guard<std::mutex> lock(m_kqMutex);
+                syncDirectChildFileWatches(item);
+            }
+
+            if (ev.fflags & NOTE_DELETE) {
+                batch.emplace_back(EventType::kDelete, item->path, PathType::DIRECTORY);
+            }
+        } else {
+            // 独立单文件监控项
+            if (ev.fflags & (NOTE_WRITE | NOTE_EXTEND | NOTE_ATTRIB)) {
+                batch.emplace_back(EventType::kModify, item->path, PathType::FILE);
+            }
+            if (ev.fflags & NOTE_RENAME) {
+                batch.emplace_back(EventType::kRename, item->path, PathType::FILE);
+            }
+            if (ev.fflags & NOTE_DELETE) {
+                batch.emplace_back(EventType::kDelete, item->path, PathType::FILE);
+            }
+        }
+
+        if (!batch.empty()) {
+            pushEventsToMainThread(batch);
+        }
+    }
+
+    void diffDirectorySnapshot(const std::shared_ptr<KqItem>& item,
+                               const std::unordered_map<std::string, DirectChildSnapshot>& newSnap,
+                               std::vector<FileEvent>& batch) {
+        const auto& oldSnap = item->children;
+
+        // 1. 查找新增项
+        std::vector<std::string> createdPaths;
+        for (const auto& pair : newSnap) {
+            if (oldSnap.find(pair.first) == oldSnap.end()) {
+                createdPaths.push_back(pair.first);
+            }
+        }
+
+        // 2. 查找删除项
+        std::vector<std::string> deletedPaths;
+        for (const auto& pair : oldSnap) {
+            if (newSnap.find(pair.first) == newSnap.end()) {
+                deletedPaths.push_back(pair.first);
+            }
+        }
+
+        // 3. 匹配重命名
+        if (createdPaths.size() == 1 && deletedPaths.size() == 1 &&
+            newSnap.at(createdPaths[0]).type == oldSnap.at(deletedPaths[0]).type) {
+            const std::string& newP = createdPaths[0];
+            const std::string& oldP = deletedPaths[0];
+            const PathType pType = newSnap.at(newP).type;
+            batch.emplace_back(EventType::kRename, newP, pType, oldP, pType);
+        } else {
+            for (const auto& p : createdPaths) {
+                batch.emplace_back(EventType::kCreate, p, newSnap.at(p).type);
+            }
+            for (const auto& p : deletedPaths) {
+                batch.emplace_back(EventType::kDelete, p, oldSnap.at(p).type);
+            }
+        }
+
+        // 4. 查找未打开直接监听项的修改
+        for (const auto& pair : newSnap) {
+            auto itOld = oldSnap.find(pair.first);
+            if (itOld != oldSnap.end()) {
+                if (pair.second.type == PathType::FILE) {
+                    if (pair.second.mtime != itOld->second.mtime || pair.second.size != itOld->second.size) {
+                        batch.emplace_back(EventType::kModify, pair.first, PathType::FILE);
+                    }
+                }
+            }
+        }
+
+        // 更新快照
+        item->children = newSnap;
+    }
+
+    // ==========================================
+    // FSEvents 子引擎实现（专管递归整树监控）
+    // ==========================================
     static bool isPathPrefixOf(const std::string& parent, const std::string& child) {
         if (child == parent) {
             return true;
@@ -147,12 +597,6 @@ private:
         return a.second == PathType::FILE && b.second == PathType::DIRECTORY;
     }
 
-    void emitEventIfPasses(const FileEvent& fileEvent) {
-        if (m_filter.passes(fileEvent) && m_callback) {
-            m_callback(fileEvent);
-        }
-    }
-
     void rememberPath(const std::string& path, PathType pathType) {
         std::lock_guard<std::mutex> lock(m_knownPathsMutex);
         m_knownPaths.insert(path);
@@ -164,7 +608,7 @@ private:
         m_knownPaths.erase(path);
         m_knownPathTypes.erase(path);
 
-        std::unordered_set<std::string>::iterator knownIt = m_knownPaths.begin();
+        auto knownIt = m_knownPaths.begin();
         while (knownIt != m_knownPaths.end()) {
             if (isPathPrefixOf(path, *knownIt)) {
                 knownIt = m_knownPaths.erase(knownIt);
@@ -173,7 +617,7 @@ private:
             }
         }
 
-        std::unordered_map<std::string, PathType>::iterator typeIt = m_knownPathTypes.begin();
+        auto typeIt = m_knownPathTypes.begin();
         while (typeIt != m_knownPathTypes.end()) {
             if (isPathPrefixOf(path, typeIt->first)) {
                 typeIt = m_knownPathTypes.erase(typeIt);
@@ -190,7 +634,7 @@ private:
 
     bool getKnownPathType(const std::string& path, PathType& pathType) {
         std::lock_guard<std::mutex> lock(m_knownPathsMutex);
-        std::unordered_map<std::string, PathType>::const_iterator it = m_knownPathTypes.find(path);
+        auto it = m_knownPathTypes.find(path);
         if (it == m_knownPathTypes.end()) {
             return false;
         }
@@ -201,7 +645,7 @@ private:
     std::vector<std::pair<std::string, PathType> > collectKnownDescendantsForDelete(const std::string& dirPath) {
         std::vector<std::pair<std::string, PathType> > descendants;
         std::lock_guard<std::mutex> lock(m_knownPathsMutex);
-        for (std::unordered_map<std::string, PathType>::const_iterator it = m_knownPathTypes.begin(); it != m_knownPathTypes.end(); ++it) {
+        for (auto it = m_knownPathTypes.begin(); it != m_knownPathTypes.end(); ++it) {
             if (it->first != dirPath && isPathPrefixOf(dirPath, it->first)) {
                 descendants.push_back(*it);
             }
@@ -245,61 +689,18 @@ private:
         closedir(dir);
     }
 
-    void watchLoop() {
-        // 创建 FSEvents 流
-        createEventStream();
-
-        // 启动 FSEvents 流
-        if (m_eventStream) {
-            FSEventStreamSetDispatchQueue(m_eventStream, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
-            FSEventStreamStart(m_eventStream);
-
-            // 保持现有阻塞语义，直到 stop() 将 m_running 置为 false
-            while (m_running) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
-        }
-    }
-
-    void createEventStream() {
+    void startFSEvents() {
         std::lock_guard<std::mutex> lock(m_mutex);
-
-        if (m_watchList.empty()) {
+        if (m_fseventsWatchList.empty()) {
             return;
         }
 
-        // 转换路径为 CFStringRef 数组
-        CFArrayRef pathsToWatch = createPathArray();
-        if (!pathsToWatch) {
-            return;
-        }
-
-        // 配置 FSEvents 流
-        FSEventStreamContext context = {0};
-        context.info = this;
-
-        // 创建 FSEvents 流
-        m_eventStream = FSEventStreamCreate(
-            nullptr,
-            &MacOSWatcher::eventCallback,
-            &context,
-            pathsToWatch,
-            kFSEventStreamEventIdSinceNow,
-            0.1, // 事件延迟（秒）
-            kFSEventStreamCreateFlagFileEvents
-        );
-
-        // 释放路径数组
-        CFRelease(pathsToWatch);
-    }
-
-    CFArrayRef createPathArray() {
-        CFMutableArrayRef pathArray = CFArrayCreateMutable(nullptr, m_watchList.size(), &kCFTypeArrayCallBacks);
+        CFMutableArrayRef pathArray = CFArrayCreateMutable(nullptr, m_fseventsWatchList.size(), &kCFTypeArrayCallBacks);
         if (!pathArray) {
-            return nullptr;
+            return;
         }
 
-        for (const std::string& path : m_watchList) {
+        for (const std::string& path : m_fseventsWatchList) {
             CFStringRef cfPath = CFStringCreateWithCString(nullptr, path.c_str(), kCFStringEncodingUTF8);
             if (cfPath) {
                 CFArrayAppendValue(pathArray, cfPath);
@@ -307,17 +708,47 @@ private:
             }
         }
 
-        return pathArray;
+        FSEventStreamContext context = {0};
+        context.info = this;
+
+        m_eventStream = FSEventStreamCreate(
+            nullptr,
+            &MacOSWatcher::eventCallback,
+            &context,
+            pathArray,
+            kFSEventStreamEventIdSinceNow,
+            0.1, // 延迟 0.1s
+            kFSEventStreamCreateFlagFileEvents
+        );
+
+        CFRelease(pathArray);
+
+        if (m_eventStream) {
+            FSEventStreamSetDispatchQueue(m_eventStream, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+            FSEventStreamStart(m_eventStream);
+        }
+    }
+
+    void stopFSEvents() {
+        if (m_eventStream) {
+            FSEventStreamStop(m_eventStream);
+            FSEventStreamInvalidate(m_eventStream);
+            FSEventStreamRelease(m_eventStream);
+            m_eventStream = nullptr;
+        }
     }
 
     static void eventCallback(ConstFSEventStreamRef streamRef, void* clientCallBackInfo, size_t numEvents, void* eventPaths, const FSEventStreamEventFlags eventFlags[], const FSEventStreamEventId eventIds[]) {
+        (void)streamRef;
+        (void)eventIds;
         MacOSWatcher* watcher = static_cast<MacOSWatcher*>(clientCallBackInfo);
-        watcher->processEvents(numEvents, eventPaths, eventFlags);
+        watcher->processFSEvents(numEvents, eventPaths, eventFlags);
     }
 
-    void processEvents(size_t numEvents, void* eventPaths, const FSEventStreamEventFlags eventFlags[]) {
+    void processFSEvents(size_t numEvents, void* eventPaths, const FSEventStreamEventFlags eventFlags[]) {
         char** paths = static_cast<char**>(eventPaths);
         std::vector<std::pair<std::string, PathType> > pendingRenameSources;
+        std::vector<FileEvent> batch;
 
         for (size_t i = 0; i < numEvents; ++i) {
             std::string path = paths[i];
@@ -330,7 +761,6 @@ private:
             const FSEventStreamEventFlags flags = eventFlags[i];
             const bool seenBefore = hasSeenPath(path);
 
-            // 优先使用 FSEvents 自带类型标记，删除事件下 stat 可能失败。
             if (flags & kFSEventStreamEventFlagItemIsDir) {
                 pathType = PathType::DIRECTORY;
             } else if (flags & kFSEventStreamEventFlagItemIsFile) {
@@ -347,15 +777,13 @@ private:
                 }
             }
 
-            // 解析事件类型：先删除，再创建，避免组合标记误判。
             if (flags & kFSEventStreamEventFlagItemRemoved) {
                 eventType = EventType::kDelete;
 
                 if (pathType == PathType::DIRECTORY) {
                     std::vector<std::pair<std::string, PathType> > descendants = collectKnownDescendantsForDelete(path);
                     for (size_t j = 0; j < descendants.size(); ++j) {
-                        FileEvent childDelete(EventType::kDelete, descendants[j].first, descendants[j].second);
-                        emitEventIfPasses(childDelete);
+                        batch.emplace_back(EventType::kDelete, descendants[j].first, descendants[j].second);
                     }
                 }
 
@@ -365,11 +793,9 @@ private:
                 const bool pathExists = (stat(path.c_str(), &stat_buf) == 0);
 
                 if (!pathExists) {
-                    // 先缓存为 rename old-path，循环末尾若仍未配对再降级为 DELETE。
                     pendingRenameSources.push_back(std::make_pair(path, pathType));
                     continue;
                 } else if (!seenBefore) {
-                    // 优先尝试与同批次中消失的路径配对成 RENAME。
                     size_t matchedIndex = pendingRenameSources.size();
                     for (size_t j = 0; j < pendingRenameSources.size(); ++j) {
                         if (pendingRenameSources[j].second == pathType) {
@@ -387,7 +813,6 @@ private:
                         forgetPath(oldPath);
                         rememberPath(path, pathType);
                     } else {
-                        // 路径存在且首次出现，更接近“新建/移动进入监控范围”。
                         eventType = EventType::kCreate;
                         rememberPath(path, pathType);
                     }
@@ -396,7 +821,6 @@ private:
                     rememberPath(path, pathType);
                 }
             } else if (flags & kFSEventStreamEventFlagItemCreated) {
-                // 某些编辑器在覆盖保存时可能仍带 Created 标记；已存在路径按 MODIFY 处理。
                 eventType = seenBefore ? EventType::kModify : EventType::kCreate;
                 rememberPath(path, pathType);
             } else if ((flags & kFSEventStreamEventFlagItemModified) ||
@@ -408,18 +832,13 @@ private:
                 rememberPath(path, pathType);
             }
 
-            // 目录的元数据变化噪声较多，这里抑制 DIRECTORY + MODIFY 事件。
             if (pathType == PathType::DIRECTORY && eventType == EventType::kModify) {
                 continue;
             }
 
-            // 创建 FileEvent 对象
-            FileEvent fileEvent(eventType, path, pathType, hasOldPath ? oldPath : "", oldPathType);
-
-            emitEventIfPasses(fileEvent);
+            batch.emplace_back(eventType, path, pathType, hasOldPath ? oldPath : "", oldPathType);
         }
 
-        // 未配对的 rename old-path 视为删除，保证不会丢失事件。
         for (size_t i = 0; i < pendingRenameSources.size(); ++i) {
             const std::string& oldPath = pendingRenameSources[i].first;
             const PathType oldType = pendingRenameSources[i].second;
@@ -427,14 +846,64 @@ private:
             if (oldType == PathType::DIRECTORY) {
                 std::vector<std::pair<std::string, PathType> > descendants = collectKnownDescendantsForDelete(oldPath);
                 for (size_t j = 0; j < descendants.size(); ++j) {
-                    FileEvent childDelete(EventType::kDelete, descendants[j].first, descendants[j].second);
-                    emitEventIfPasses(childDelete);
+                    batch.emplace_back(EventType::kDelete, descendants[j].first, descendants[j].second);
                 }
             }
 
             forgetPath(oldPath);
-            FileEvent deleteEvent(EventType::kDelete, oldPath, oldType);
-            emitEventIfPasses(deleteEvent);
+            batch.emplace_back(EventType::kDelete, oldPath, oldType);
+        }
+
+        if (!batch.empty()) {
+            pushEventsToMainThread(batch);
+        }
+    }
+
+    // ==========================================
+    // 主线程统一事件循环
+    // ==========================================
+    void watchLoop() {
+        startFSEvents();
+
+        while (m_running) {
+            if (m_spFds[0] == -1) {
+                break;
+            }
+
+            fd_set readfds;
+            FD_ZERO(&readfds);
+            FD_SET(m_spFds[0], &readfds);
+
+            int64_t timeoutMs = 1000;
+            if (m_nextTimeoutProvider) {
+                timeoutMs = m_nextTimeoutProvider();
+                if (timeoutMs < 0) timeoutMs = 0;
+                if (timeoutMs > 1000) timeoutMs = 1000;
+            }
+
+            struct timeval tv;
+            tv.tv_sec = timeoutMs / 1000;
+            tv.tv_usec = (timeoutMs % 1000) * 1000;
+
+            int ret = select(m_spFds[0] + 1, &readfds, nullptr, nullptr, &tv);
+            if (ret > 0 && FD_ISSET(m_spFds[0], &readfds)) {
+                char drainBuf[128];
+                while (read(m_spFds[0], drainBuf, sizeof(drainBuf)) > 0) {}
+            }
+
+            // 统一在主线程中按序派发所有事件
+            dispatchPendingEventsOnMainThread();
+
+            // 统一在主线程中按序派发到期定时器
+            if (m_timerExpiryHandler) {
+                m_timerExpiryHandler();
+            }
+        }
+
+        // 退出前排空剩余未派发事件与到期定时器
+        dispatchPendingEventsOnMainThread();
+        if (m_timerExpiryHandler) {
+            m_timerExpiryHandler();
         }
     }
 };

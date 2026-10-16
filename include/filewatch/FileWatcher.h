@@ -8,6 +8,7 @@
 #include <vector>
 #include <regex>
 #include "Event.h"
+#include "Timer.h"
 #include "LinuxBackend.h"
 
 namespace filewatch {
@@ -104,8 +105,23 @@ public:
     bool start();
 
     /**
-        * 停止监控
-        * 通常由其他线程调用，用于终止 start() 所在的事件循环。
+     * 添加/激活定时器（参考 libevent 风格，外部持有 Timer 对象，零动态分配）
+     * @param timer 外部持有的定时器对象
+     * @param timeoutMs 超时时间（毫秒）
+     * @return 是否添加成功
+     */
+    bool addTimer(Timer& timer, uint32_t timeoutMs);
+
+    /**
+     * 移除/取消定时器
+     * @param timer 外部持有的定时器对象
+     * @return 是否移除成功
+     */
+    bool removeTimer(Timer& timer);
+
+    /**
+     * 停止监控
+     * 通常由其他线程调用，用于终止 start() 所在的事件循环。
      */
     void stop();
 

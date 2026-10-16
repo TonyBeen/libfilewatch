@@ -10,6 +10,8 @@
 
 #ifdef __linux__
 #include <sys/inotify.h>
+#include <sys/poll.h>
+#include <sys/eventfd.h>
 #include <unistd.h>
 #include <errno.h>
 #include <dirent.h>
@@ -20,9 +22,12 @@ namespace filewatch {
 class InotifyWatcher : public PlatformWatcher {
 private:
     int m_inotifyFd;
+    int m_wakeupFd;
     std::unordered_map<int, std::string>    m_watchMap;         // watch descriptor -> path
     std::unordered_map<std::string, int>    m_pathWatchMap;     // path -> watch descriptor
     std::unordered_map<int, bool>           m_watchRecursive;   // watch descriptor -> recursive
+    std::function<int64_t()>                m_nextTimeoutProvider;
+    std::function<void()>                   m_timerExpiryHandler;
     std::atomic<bool>                       m_running;
     std::function<void(const FileEvent&)>   m_callback;
     std::mutex                              m_mutex;
@@ -36,8 +41,9 @@ private:
 
 public:
     explicit InotifyWatcher(std::function<void(const FileEvent&)> callback)
-        : m_inotifyFd(-1), m_running(false), m_callback(callback) {
+        : m_inotifyFd(-1), m_wakeupFd(-1), m_running(false), m_callback(callback) {
         m_inotifyFd = inotify_init1(IN_NONBLOCK);
+        m_wakeupFd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     }
 
     ~InotifyWatcher() {
@@ -46,7 +52,25 @@ public:
         }
         if (m_inotifyFd != -1) {
             close(m_inotifyFd);
+            m_inotifyFd = -1;
         }
+        if (m_wakeupFd != -1) {
+            close(m_wakeupFd);
+            m_wakeupFd = -1;
+        }
+    }
+
+    void wakeup() override {
+        if (m_wakeupFd != -1) {
+            uint64_t one = 1;
+            (void)write(m_wakeupFd, &one, sizeof(one));
+        }
+    }
+
+    void setTimerHandlers(std::function<int64_t()> nextTimeoutProvider,
+                          std::function<void()> expiryHandler) override {
+        m_nextTimeoutProvider = std::move(nextTimeoutProvider);
+        m_timerExpiryHandler = std::move(expiryHandler);
     }
 
     bool addWatch(const std::string& path, bool recursive) override {
@@ -112,6 +136,7 @@ public:
         }
 
         m_running = false;
+        wakeup();
     }
 
 private:
@@ -173,28 +198,58 @@ private:
 
     void watchLoop() {
         char buffer[64 * 1024];
+        struct pollfd fds[2];
+        fds[0].fd = m_inotifyFd;
+        fds[0].events = POLLIN;
+        fds[1].fd = m_wakeupFd;
+        fds[1].events = POLLIN;
+
         while (m_running) {
-            int len = read(m_inotifyFd, buffer, sizeof(buffer));
-            if (len == -1) {
-                if (errno != EAGAIN) {
-                    break;
-                }
-                // 等待一段时间后重试
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                continue;
+            int64_t timeoutMs = 1000;
+            if (m_nextTimeoutProvider) {
+                timeoutMs = m_nextTimeoutProvider();
+                if (timeoutMs < 0) timeoutMs = 0;
+                if (timeoutMs > 1000) timeoutMs = 1000;
             }
 
-            char* p = buffer;
-            char* end = buffer + len;
-            while (p + static_cast<int>(sizeof(struct inotify_event)) <= end) {
-                struct inotify_event* event = reinterpret_cast<struct inotify_event*>(p);
-                const size_t eventSize = sizeof(struct inotify_event) + event->len;
-                if (p + static_cast<int>(eventSize) > end) {
-                    break;
+            int nfds = (m_wakeupFd != -1) ? 2 : 1;
+            int ret = poll(fds, nfds, static_cast<int>(timeoutMs));
+            if (ret < 0) {
+                if (errno == EINTR) {
+                    continue;
                 }
-                processEvent(event);
-                p += eventSize;
+                break;
             }
+
+            if (m_wakeupFd != -1 && (fds[1].revents & POLLIN)) {
+                uint64_t val = 0;
+                while (read(m_wakeupFd, &val, sizeof(val)) > 0) {}
+            }
+
+            if (fds[0].revents & POLLIN) {
+                int len = read(m_inotifyFd, buffer, sizeof(buffer));
+                if (len > 0) {
+                    char* p = buffer;
+                    char* end = buffer + len;
+                    while (p + static_cast<int>(sizeof(struct inotify_event)) <= end) {
+                        struct inotify_event* event = reinterpret_cast<struct inotify_event*>(p);
+                        const size_t eventSize = sizeof(struct inotify_event) + event->len;
+                        if (p + static_cast<int>(eventSize) > end) {
+                            break;
+                        }
+                        processEvent(event);
+                        p += eventSize;
+                    }
+                }
+            }
+
+            if (m_timerExpiryHandler) {
+                m_timerExpiryHandler();
+            }
+        }
+
+        if (m_timerExpiryHandler) {
+            m_timerExpiryHandler();
         }
     }
 

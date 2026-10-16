@@ -135,6 +135,14 @@ public:
         m_platformWatcher = createPlatformWatcher(backend, [this](const FileEvent& event) {
             processEvent(event);
         });
+        m_platformWatcher->setTimerHandlers(
+            [this]() -> int64_t {
+                return getNextTimeoutMs();
+            },
+            [this]() {
+                processExpiredTimers();
+            }
+        );
     }
 
     ~Impl() {
@@ -156,17 +164,17 @@ public:
         try {
             {
                 std::lock_guard<std::mutex> lock(m_callbacksMutex);
-                if (m_callbacks.find(normalizedPath) != m_callbacks.end()) {
+                if (m_watches.find(normalizedPath) != m_watches.end()) {
                     setError(errc::watcher_errc::already_watching);
                     return false;
                 }
-                m_callbacks[normalizedPath] = callback;
+                m_watches[normalizedPath] = WatchEntry{callback, recursive};
             }
 
             if (!m_platformWatcher->addWatch(normalizedPath, recursive)) {
                 setError(errc::watcher_errc::platform_error);
                 std::lock_guard<std::mutex> lock(m_callbacksMutex);
-                m_callbacks.erase(normalizedPath);
+                m_watches.erase(normalizedPath);
                 return false;
             }
             setError(errc::watcher_errc::success);
@@ -188,7 +196,7 @@ public:
         try {
             {
                 std::lock_guard<std::mutex> lock(m_callbacksMutex);
-                m_callbacks.erase(normalizedPath);
+                m_watches.erase(normalizedPath);
             }
             if (!m_platformWatcher->removeWatch(normalizedPath)) {
                 setError(errc::watcher_errc::platform_error);
@@ -256,13 +264,138 @@ public:
         return m_lastError;
     }
 
+    bool addTimer(Timer& timer, uint32_t timeoutMs) {
+        auto now = std::chrono::steady_clock::now();
+        {
+            std::lock_guard<std::mutex> lock(m_timersMutex);
+            timer.m_intervalMs = timeoutMs;
+            timer.m_expireTime = now + std::chrono::milliseconds(timeoutMs);
+            timer.m_active = true;
+
+            auto it = std::find(m_timers.begin(), m_timers.end(), &timer);
+            if (it == m_timers.end()) {
+                m_timers.push_back(&timer);
+            }
+        }
+        if (m_platformWatcher) {
+            m_platformWatcher->wakeup();
+        }
+        return true;
+    }
+
+    bool removeTimer(Timer& timer) {
+        {
+            std::lock_guard<std::mutex> lock(m_timersMutex);
+            timer.m_active = false;
+            auto it = std::find(m_timers.begin(), m_timers.end(), &timer);
+            if (it != m_timers.end()) {
+                m_timers.erase(it);
+            }
+        }
+        if (m_platformWatcher) {
+            m_platformWatcher->wakeup();
+        }
+        return true;
+    }
+
+    int64_t getNextTimeoutMs() {
+        std::lock_guard<std::mutex> lock(m_timersMutex);
+        if (m_timers.empty()) {
+            return 1000; // 0 定时器时最长等待 1s
+        }
+
+        auto now = std::chrono::steady_clock::now();
+        int64_t minDiffMs = 1000;
+        bool hasActive = false;
+
+        for (Timer* t : m_timers) {
+            if (t && t->m_active) {
+                hasActive = true;
+                if (t->m_expireTime <= now) {
+                    return 0;
+                }
+                int64_t diff = std::chrono::duration_cast<std::chrono::milliseconds>(t->m_expireTime - now).count();
+                if (diff < minDiffMs) {
+                    minDiffMs = diff;
+                }
+            }
+        }
+
+        if (!hasActive) {
+            return 1000;
+        }
+
+        if (minDiffMs < 0) minDiffMs = 0;
+        if (minDiffMs > 1000) minDiffMs = 1000;
+        return minDiffMs;
+    }
+
+    void processExpiredTimers() {
+        std::vector<Timer*> expired;
+        auto now = std::chrono::steady_clock::now();
+
+        {
+            std::lock_guard<std::mutex> lock(m_timersMutex);
+            for (auto it = m_timers.begin(); it != m_timers.end(); ) {
+                Timer* t = *it;
+                if (!t || !t->m_active) {
+                    it = m_timers.erase(it);
+                    continue;
+                }
+
+                if (t->m_expireTime <= now) {
+                    expired.push_back(t);
+                    if (t->m_repeating) {
+                        t->m_expireTime = now + std::chrono::milliseconds(t->m_intervalMs);
+                        ++it;
+                    } else {
+                        ++it;
+                    }
+                } else {
+                    ++it;
+                }
+            }
+        }
+
+        // 统一在主线程执行回调
+        for (Timer* t : expired) {
+            Timer::Callback cb;
+            {
+                std::lock_guard<std::mutex> lock(m_timersMutex);
+                if (!t || !t->m_active) {
+                    continue; // 可能在先前的回调中被主动 removeTimer
+                }
+                if (!t->m_repeating) {
+                    t->m_active = false;
+                    auto it = std::find(m_timers.begin(), m_timers.end(), t);
+                    if (it != m_timers.end()) {
+                        m_timers.erase(it);
+                    }
+                }
+                cb = t->m_callback;
+            }
+
+            if (cb) {
+                try {
+                    cb(*t);
+                } catch (...) {
+                }
+            }
+        }
+    }
+
     void setFilter(const FileWatcher::Filter& filter) {
         std::lock_guard<std::mutex> lock(m_filterMutex);
         m_filter = filter;
     }
 
 private:
-    static bool isPathUnderWatch(const std::string& watchPath, const std::string& eventPath) {
+    struct WatchEntry {
+        EventCallback callback;
+        bool recursive;
+    };
+
+    static bool isPathUnderWatch(const std::string& watchPath, const std::string& eventPath, bool recursive) {
         if (watchPath.empty()) {
             return false;
         }
@@ -272,25 +405,42 @@ private:
         std::replace(w.begin(), w.end(), '\\', '/');
         std::replace(e.begin(), e.end(), '\\', '/');
 
+        // 去除末尾斜杠
+        while (w.size() > 1 && w.back() == '/') {
+            w.pop_back();
+        }
+
         if (e == w) {
             return true;
         }
         if (e.size() <= w.size() || e.compare(0, w.size(), w) != 0) {
             return false;
         }
-        if (w[w.size() - 1] == '/') {
+        if (e[w.size()] != '/') {
+            return false;
+        }
+
+        // recursive = true 时，所有子目录及更深层项均在监控范围内
+        if (recursive) {
             return true;
         }
-        return e[w.size()] == '/';
+
+        // recursive = false 时，只放行直接子项（相对路径中不能包含 /）
+        std::string relative = e.substr(w.size() + 1);
+        return relative.find('/') == std::string::npos;
     }
 
     std::unique_ptr<PlatformWatcher> m_platformWatcher;
-    std::unordered_map<std::string, EventCallback> m_callbacks;
+    std::unordered_map<std::string, WatchEntry> m_watches;
     mutable std::mutex m_callbacksMutex;
     std::error_code m_lastError; // 存储最后一个错误
     mutable std::mutex m_errorMutex;
     FileWatcher::Filter m_filter; // 事件过滤器
     mutable std::mutex m_filterMutex;
+
+    // 定时器管理（外部持有对象，零动态内存分配）
+    std::vector<Timer*> m_timers;
+    mutable std::mutex m_timersMutex;
 
     // 仅保留防抖，不再使用后台批处理线程
     std::unordered_map<std::string, std::chrono::steady_clock::time_point> m_debounceMap; // 防抖映射
@@ -371,9 +521,9 @@ private:
         std::vector<EventCallback> callbacks;
         {
             std::lock_guard<std::mutex> lock(m_callbacksMutex);
-            for (const auto& pair : m_callbacks) {
-                if (isPathUnderWatch(pair.first, event.getPath())) {
-                    callbacks.push_back(pair.second);
+            for (const auto& pair : m_watches) {
+                if (isPathUnderWatch(pair.first, event.getPath(), pair.second.recursive)) {
+                    callbacks.push_back(pair.second.callback);
                 }
             }
         }
@@ -405,6 +555,14 @@ bool FileWatcher::addWatchWithRegex(const std::string& directory, const std::str
 
 bool FileWatcher::start() {
     return m_impl->start();
+}
+
+bool FileWatcher::addTimer(Timer& timer, uint32_t timeoutMs) {
+    return m_impl->addTimer(timer, timeoutMs);
+}
+
+bool FileWatcher::removeTimer(Timer& timer) {
+    return m_impl->removeTimer(timer);
 }
 
 void FileWatcher::stop() {
