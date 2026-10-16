@@ -2,13 +2,13 @@
 #include "utils/EncodingUtils.h"
 #include "utils/PathUtils.h"
 #include <vector>
-#include <thread>
 #include <atomic>
 #include <mutex>
 #include <chrono>
 #include <functional>
 #include <algorithm>
 #include <unordered_map>
+#include <memory>
 
 #ifdef _WIN32
 #include <Windows.h>
@@ -17,58 +17,131 @@ namespace filewatch {
 
 class WindowsWatcher : public PlatformWatcher {
 private:
-    struct WatchInfo {
+    static const ULONG_PTR WAKEUP_KEY = 1;
+
+    struct WatchItem {
         std::string path;
-        bool recursive;
+        bool recursive = false;
+        HANDLE hDir = INVALID_HANDLE_VALUE;
+        OVERLAPPED overlapped;
+        std::vector<BYTE> buffer;
     };
 
-    // 用于存储重命名事件的旧路径信息
     struct RenameInfo {
         std::string oldPath;
-        PathType oldPathType;
+        PathType oldPathType = PathType::FILE;
     };
 
-    std::vector<WatchInfo> m_watchList;
+    HANDLE m_iocp;
+    std::unordered_map<std::string, std::shared_ptr<WatchItem>> m_watches;
+    std::unordered_map<std::string, PathType> m_knownPathTypes;
+    RenameInfo m_renameInfo;
+    std::mutex m_mutex;
+
+    std::function<int64_t()> m_nextTimeoutProvider;
+    std::function<void()> m_timerExpiryHandler;
+
     std::atomic<bool> m_running;
     std::function<void(const FileEvent&)> m_callback;
-    std::mutex m_mutex;
-    RenameInfo m_renameInfo;
-    std::unordered_map<std::string, PathType> m_knownPathTypes;
 
 public:
     explicit WindowsWatcher(std::function<void(const FileEvent&)> callback)
-        : m_running(false), m_callback(callback) {
+        : m_iocp(INVALID_HANDLE_VALUE), m_running(false), m_callback(callback) {
+        m_iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 1);
     }
 
     ~WindowsWatcher() {
         if (m_running) {
             stop();
         }
+        closeAllWatches();
+        if (m_iocp != INVALID_HANDLE_VALUE) {
+            CloseHandle(m_iocp);
+            m_iocp = INVALID_HANDLE_VALUE;
+        }
+    }
+
+    void wakeup() override {
+        if (m_iocp != INVALID_HANDLE_VALUE) {
+            PostQueuedCompletionStatus(m_iocp, 0, WAKEUP_KEY, nullptr);
+        }
+    }
+
+    void setTimerHandlers(std::function<int64_t()> nextTimeoutProvider,
+                          std::function<void()> expiryHandler) override {
+        m_nextTimeoutProvider = std::move(nextTimeoutProvider);
+        m_timerExpiryHandler = std::move(expiryHandler);
     }
 
     bool addWatch(const std::string& path, bool recursive) override {
-        std::lock_guard<std::mutex> lock(m_mutex);
         const std::string normalizedPath = utils::PathUtils::normalize(path);
-        m_watchList.push_back({normalizedPath, recursive});
+        std::wstring widePath = utils::EncodingUtils::utf8ToUtf16(normalizedPath);
+        if (widePath.empty()) {
+            return false;
+        }
+
+        HANDLE hDir = CreateFileW(
+            widePath.c_str(),
+            FILE_LIST_DIRECTORY,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
+            nullptr
+        );
+
+        if (hDir == INVALID_HANDLE_VALUE) {
+            return false;
+        }
+
+        auto item = std::make_shared<WatchItem>();
+        item->path = normalizedPath;
+        item->recursive = recursive;
+        item->hDir = hDir;
+        item->buffer.resize(64 * 1024); // 64KB 缓冲区
+        ZeroMemory(&item->overlapped, sizeof(OVERLAPPED));
+
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_iocp != INVALID_HANDLE_VALUE) {
+            if (!CreateIoCompletionPort(hDir, m_iocp, reinterpret_cast<ULONG_PTR>(item.get()), 0)) {
+                CloseHandle(hDir);
+                return false;
+            }
+            if (!issueRead(item.get())) {
+                CloseHandle(hDir);
+                return false;
+            }
+        }
+
+        m_watches[normalizedPath] = item;
         m_knownPathTypes[normalizedPath] = PathType::DIRECTORY;
         return true;
     }
 
     bool removeWatch(const std::string& path) override {
-        std::lock_guard<std::mutex> lock(m_mutex);
         const std::string normalizedPath = utils::PathUtils::normalize(path);
-        auto it = std::find_if(m_watchList.begin(), m_watchList.end(), 
-            [&normalizedPath](const WatchInfo& info) { return info.path == normalizedPath; });
-        if (it != m_watchList.end()) {
-            m_knownPathTypes.erase(it->path);
-            m_watchList.erase(it);
-            return true;
+        std::shared_ptr<WatchItem> item;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            auto it = m_watches.find(normalizedPath);
+            if (it == m_watches.end()) {
+                return false;
+            }
+            item = it->second;
+            m_watches.erase(it);
+            m_knownPathTypes.erase(normalizedPath);
         }
-        return false;
+
+        if (item && item->hDir != INVALID_HANDLE_VALUE) {
+            CancelIoEx(item->hDir, &item->overlapped);
+            CloseHandle(item->hDir);
+            item->hDir = INVALID_HANDLE_VALUE;
+        }
+        return true;
     }
 
     bool start() override {
-        if (m_running) {
+        if (m_running || m_iocp == INVALID_HANDLE_VALUE) {
             return false;
         }
 
@@ -83,10 +156,50 @@ public:
         }
 
         m_running = false;
+        wakeup();
     }
 
 private:
-    std::string joinWindowsPath(const std::string& base, const std::string& child) {
+    bool issueRead(WatchItem* item) {
+        if (!item || item->hDir == INVALID_HANDLE_VALUE) {
+            return false;
+        }
+
+        ZeroMemory(&item->overlapped, sizeof(OVERLAPPED));
+        DWORD bytesRead = 0;
+        BOOL ok = ReadDirectoryChangesW(
+            item->hDir,
+            item->buffer.data(),
+            static_cast<DWORD>(item->buffer.size()),
+            item->recursive ? TRUE : FALSE,
+            FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME |
+            FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_ATTRIBUTES,
+            &bytesRead,
+            &item->overlapped,
+            nullptr
+        );
+
+        if (!ok && GetLastError() != ERROR_IO_PENDING) {
+            return false;
+        }
+        return true;
+    }
+
+    void closeAllWatches() {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        for (auto& pair : m_watches) {
+            auto item = pair.second;
+            if (item && item->hDir != INVALID_HANDLE_VALUE) {
+                CancelIoEx(item->hDir, &item->overlapped);
+                CloseHandle(item->hDir);
+                item->hDir = INVALID_HANDLE_VALUE;
+            }
+        }
+        m_watches.clear();
+        m_knownPathTypes.clear();
+    }
+
+    static std::string joinWindowsPath(const std::string& base, const std::string& child) {
         if (base.empty()) {
             return utils::PathUtils::normalize(child);
         }
@@ -97,24 +210,7 @@ private:
         return utils::PathUtils::normalize(base + "\\" + child);
     }
 
-    void watchLoop() {
-        while (m_running) {
-            std::vector<WatchInfo> watchListSnapshot;
-            {
-                std::lock_guard<std::mutex> lock(m_mutex);
-                watchListSnapshot = m_watchList;
-            }
-
-            for (const auto& watchInfo : watchListSnapshot) {
-                watchDirectory(watchInfo.path, watchInfo.recursive);
-            }
-
-            // 等待一段时间后重试
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
-    }
-
-    bool IsDirectory(const std::string& path) {
+    static bool isDirectory(const std::string& path) {
         std::wstring widePath = utils::EncodingUtils::utf8ToUtf16(path);
         if (widePath.empty()) {
             return false;
@@ -123,150 +219,148 @@ private:
         return (attr != INVALID_FILE_ATTRIBUTES) && (attr & FILE_ATTRIBUTE_DIRECTORY);
     }
 
-    void watchDirectory(const std::string& path, bool recursive) {
-        std::wstring widePath = utils::EncodingUtils::utf8ToUtf16(path);
-        if (widePath.empty()) {
-            return;
-        }
+    void watchLoop() {
+        while (m_running) {
+            int64_t timeoutMs = 1000;
+            if (m_nextTimeoutProvider) {
+                timeoutMs = m_nextTimeoutProvider();
+                if (timeoutMs < 0) timeoutMs = 0;
+                if (timeoutMs > 1000) timeoutMs = 1000;
+            }
 
-        HANDLE hDir = CreateFileW(
-            widePath.c_str(),
-            FILE_LIST_DIRECTORY,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            NULL,
-            OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
-            NULL
-        );
+            DWORD bytesTransferred = 0;
+            ULONG_PTR completionKey = 0;
+            LPOVERLAPPED lpOverlapped = nullptr;
 
-        if (hDir == INVALID_HANDLE_VALUE) {
-            return;
-        }
+            BOOL ok = GetQueuedCompletionStatus(
+                m_iocp,
+                &bytesTransferred,
+                &completionKey,
+                &lpOverlapped,
+                static_cast<DWORD>(timeoutMs)
+            );
 
-        char buffer[4096];
-        DWORD bytesRead;
-        OVERLAPPED overlapped = {0};
-        overlapped.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+            if (!ok && lpOverlapped == nullptr) {
+                // 超时（WAIT_TIMEOUT）或其他非 I/O 错误，正常流转
+            } else if (completionKey == WAKEUP_KEY) {
+                // 由 wakeup() 触发的唤醒包，用于重算超时或退出循环
+            } else if (completionKey != 0 && lpOverlapped != nullptr) {
+                WatchItem* item = reinterpret_cast<WatchItem*>(completionKey);
+                if (ok && bytesTransferred > 0) {
+                    processNotifications(item, bytesTransferred);
+                }
 
-        if (!overlapped.hEvent) {
-            CloseHandle(hDir);
-            return;
-        }
+                // 重新下发此目录的异步监控请求
+                std::lock_guard<std::mutex> lock(m_mutex);
+                if (m_running && item->hDir != INVALID_HANDLE_VALUE) {
+                    issueRead(item);
+                }
+            }
 
-        // 开始监控
-        if (!ReadDirectoryChangesW(
-            hDir,
-            buffer,
-            sizeof(buffer),
-            recursive,
-            FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME |
-            FILE_NOTIFY_CHANGE_LAST_WRITE,
-            &bytesRead,
-            &overlapped,
-            NULL
-        )) {
-            CloseHandle(overlapped.hEvent);
-            CloseHandle(hDir);
-            return;
-        }
-
-        // 等待事件
-        DWORD waitResult = WaitForSingleObject(overlapped.hEvent, 100); // 100ms 超时
-        if (waitResult == WAIT_OBJECT_0) {
-            // 获取实际读取的字节数
-            if (GetOverlappedResult(hDir, &overlapped, &bytesRead, FALSE)) {
-                // 处理 Windows 目录变化事件
-                DWORD offset = 0;
-                FILE_NOTIFY_INFORMATION* notifyInfo;
-
-                do {
-                    notifyInfo = reinterpret_cast<FILE_NOTIFY_INFORMATION*>(buffer + offset);
-
-                    // 转换文件名（UTF-16 到 UTF-8）
-                    std::wstring wideName(notifyInfo->FileName, notifyInfo->FileNameLength / sizeof(wchar_t));
-                    std::string fileName = utils::EncodingUtils::utf16ToUtf8(wideName);
-
-                    std::string eventPath = joinWindowsPath(path, fileName);
-                    PathType pathType = PathType::FILE;
-
-                    // 解析事件类型
-                    EventType eventType = EventType::kModify;
-                    switch (notifyInfo->Action) {
-                        case FILE_ACTION_ADDED:
-                            eventType = EventType::kCreate;
-                            pathType = IsDirectory(eventPath) ? PathType::DIRECTORY : PathType::FILE;
-                            {
-                                std::lock_guard<std::mutex> lock(m_mutex);
-                                m_knownPathTypes[eventPath] = pathType;
-                            }
-                            break;
-                        case FILE_ACTION_REMOVED:
-                            eventType = EventType::kDelete;
-                            {
-                                std::lock_guard<std::mutex> lock(m_mutex);
-                                std::unordered_map<std::string, PathType>::iterator it = m_knownPathTypes.find(eventPath);
-                                if (it != m_knownPathTypes.end()) {
-                                    pathType = it->second;
-                                    m_knownPathTypes.erase(it);
-                                }
-                            }
-                            break;
-                        case FILE_ACTION_MODIFIED:
-                            eventType = EventType::kModify;
-                            {
-                                std::lock_guard<std::mutex> lock(m_mutex);
-                                std::unordered_map<std::string, PathType>::iterator it = m_knownPathTypes.find(eventPath);
-                                if (it != m_knownPathTypes.end()) {
-                                    pathType = it->second;
-                                }
-                            }
-                            break;
-                        case FILE_ACTION_RENAMED_OLD_NAME:
-                            pathType = IsDirectory(eventPath) ? PathType::DIRECTORY : PathType::FILE;
-                            {
-                                std::lock_guard<std::mutex> lock(m_mutex);
-                                std::unordered_map<std::string, PathType>::iterator it = m_knownPathTypes.find(eventPath);
-                                if (it != m_knownPathTypes.end()) {
-                                    pathType = it->second;
-                                    m_knownPathTypes.erase(it);
-                                }
-                            }
-                            m_renameInfo.oldPath = eventPath;
-                            m_renameInfo.oldPathType = pathType;
-                            break;
-                        case FILE_ACTION_RENAMED_NEW_NAME:
-                            eventType = EventType::kRename;
-                            pathType = m_renameInfo.oldPathType;
-                            if (pathType == PathType::DIRECTORY || IsDirectory(eventPath)) {
-                                pathType = PathType::DIRECTORY;
-                            }
-                            {
-                                std::lock_guard<std::mutex> lock(m_mutex);
-                                m_knownPathTypes[eventPath] = pathType;
-                            }
-                            if (m_callback) {
-                                FileEvent fileEvent(eventType, eventPath, pathType, m_renameInfo.oldPath, m_renameInfo.oldPathType);
-                                m_callback(fileEvent);
-                            }
-                            m_renameInfo.oldPath = "";
-                            m_renameInfo.oldPathType = PathType::FILE;
-                            continue;
-                    }
-
-                    FileEvent fileEvent(eventType, eventPath, pathType);
-
-                    if (m_callback) {
-                        m_callback(fileEvent);
-                    }
-
-                    offset += notifyInfo->NextEntryOffset;
-                } while (notifyInfo->NextEntryOffset != 0);
+            // 统一在主线程执行到期定时器
+            if (m_timerExpiryHandler) {
+                m_timerExpiryHandler();
             }
         }
 
-        // 清理
-        CloseHandle(overlapped.hEvent);
-        CloseHandle(hDir);
+        // 退出后排空到期定时器
+        if (m_timerExpiryHandler) {
+            m_timerExpiryHandler();
+        }
+    }
+
+    void processNotifications(WatchItem* item, DWORD bytesTransferred) {
+        if (!item || bytesTransferred == 0) {
+            return;
+        }
+
+        DWORD offset = 0;
+        const BYTE* buf = item->buffer.data();
+
+        do {
+            const FILE_NOTIFY_INFORMATION* notifyInfo = reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(buf + offset);
+
+            std::wstring wideName(notifyInfo->FileName, notifyInfo->FileNameLength / sizeof(wchar_t));
+            std::string fileName = utils::EncodingUtils::utf16ToUtf8(wideName);
+            std::string eventPath = joinWindowsPath(item->path, fileName);
+            PathType pathType = PathType::FILE;
+
+            EventType eventType = EventType::kModify;
+            switch (notifyInfo->Action) {
+                case FILE_ACTION_ADDED:
+                    eventType = EventType::kCreate;
+                    pathType = isDirectory(eventPath) ? PathType::DIRECTORY : PathType::FILE;
+                    {
+                        std::lock_guard<std::mutex> lock(m_mutex);
+                        m_knownPathTypes[eventPath] = pathType;
+                    }
+                    break;
+                case FILE_ACTION_REMOVED:
+                    eventType = EventType::kDelete;
+                    {
+                        std::lock_guard<std::mutex> lock(m_mutex);
+                        auto it = m_knownPathTypes.find(eventPath);
+                        if (it != m_knownPathTypes.end()) {
+                            pathType = it->second;
+                            m_knownPathTypes.erase(it);
+                        }
+                    }
+                    break;
+                case FILE_ACTION_MODIFIED:
+                    eventType = EventType::kModify;
+                    {
+                        std::lock_guard<std::mutex> lock(m_mutex);
+                        auto it = m_knownPathTypes.find(eventPath);
+                        if (it != m_knownPathTypes.end()) {
+                            pathType = it->second;
+                        }
+                    }
+                    break;
+                case FILE_ACTION_RENAMED_OLD_NAME:
+                    pathType = isDirectory(eventPath) ? PathType::DIRECTORY : PathType::FILE;
+                    {
+                        std::lock_guard<std::mutex> lock(m_mutex);
+                        auto it = m_knownPathTypes.find(eventPath);
+                        if (it != m_knownPathTypes.end()) {
+                            pathType = it->second;
+                            m_knownPathTypes.erase(it);
+                        }
+                    }
+                    m_renameInfo.oldPath = eventPath;
+                    m_renameInfo.oldPathType = pathType;
+                    break;
+                case FILE_ACTION_RENAMED_NEW_NAME:
+                    eventType = EventType::kRename;
+                    pathType = m_renameInfo.oldPathType;
+                    if (pathType == PathType::DIRECTORY || isDirectory(eventPath)) {
+                        pathType = PathType::DIRECTORY;
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(m_mutex);
+                        m_knownPathTypes[eventPath] = pathType;
+                    }
+                    if (m_callback) {
+                        FileEvent fileEvent(eventType, eventPath, pathType, m_renameInfo.oldPath, m_renameInfo.oldPathType);
+                        m_callback(fileEvent);
+                    }
+                    m_renameInfo.oldPath.clear();
+                    m_renameInfo.oldPathType = PathType::FILE;
+                    goto next_entry;
+                default:
+                    break;
+            }
+
+            if (m_callback) {
+                FileEvent fileEvent(eventType, eventPath, pathType);
+                m_callback(fileEvent);
+            }
+
+        next_entry:
+            if (notifyInfo->NextEntryOffset == 0) {
+                break;
+            }
+            offset += notifyInfo->NextEntryOffset;
+        } while (offset < bytesTransferred);
     }
 };
 
