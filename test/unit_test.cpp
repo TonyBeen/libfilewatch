@@ -84,6 +84,10 @@ TEST_CASE("PathUtils class tests", "[PathUtils]") {
         bool isDir = filewatch::utils::PathUtils::isDirectory(".");
         REQUIRE(isDir == true);
 
+        // 测试不存在的路径
+        REQUIRE(filewatch::utils::PathUtils::isDirectory("non_existent_folder_abc") == false);
+        REQUIRE(filewatch::utils::PathUtils::isDirectory("") == false);
+
         // 测试文件（如果存在）
         if (filewatch::utils::PathUtils::exists("CMakeLists.txt")) {
             isDir = filewatch::utils::PathUtils::isDirectory("CMakeLists.txt");
@@ -95,6 +99,10 @@ TEST_CASE("PathUtils class tests", "[PathUtils]") {
         // 测试当前目录
         bool isFile = filewatch::utils::PathUtils::isFile(".");
         REQUIRE(isFile == false);
+
+        // 测试不存在的路径与空路径
+        REQUIRE(filewatch::utils::PathUtils::isFile("non_existent_file_abc") == false);
+        REQUIRE(filewatch::utils::PathUtils::isFile("") == false);
 
         // 测试文件（如果存在）
         if (filewatch::utils::PathUtils::exists("CMakeLists.txt")) {
@@ -192,6 +200,27 @@ TEST_CASE("FileWatcher class tests", "[FileWatcher]") {
         std::error_code ec = watcher.getLastError();
         REQUIRE(ec.value() == static_cast<int>(filewatch::errc::watcher_errc::invalid_path));
 
+        // 测试不存在的路径
+        added = watcher.addWatch("non_existent_directory_987654321", false, [](const filewatch::FileEvent&) {});
+        REQUIRE(added == false);
+        ec = watcher.getLastError();
+        REQUIRE(ec.value() == static_cast<int>(filewatch::errc::watcher_errc::path_not_exist));
+
+        // 测试重复添加路径
+        added = watcher.addWatch(".", false, [](const filewatch::FileEvent&) {});
+        REQUIRE(added == true);
+        added = watcher.addWatch(".", false, [](const filewatch::FileEvent&) {});
+        REQUIRE(added == false);
+        ec = watcher.getLastError();
+        REQUIRE(ec.value() == static_cast<int>(filewatch::errc::watcher_errc::already_watching));
+        watcher.removeWatch(".");
+
+        // 测试移除空路径
+        bool removed = watcher.removeWatch("");
+        REQUIRE(removed == false);
+        ec = watcher.getLastError();
+        REQUIRE(ec.value() == static_cast<int>(filewatch::errc::watcher_errc::invalid_path));
+
         // 测试无效正则表达式
         added = watcher.addWatchWithRegex(".", "[invalid-regex", false, [](const filewatch::FileEvent&) {});
         REQUIRE(added == false);
@@ -205,7 +234,7 @@ TEST_CASE("FileWatcher class tests", "[FileWatcher]") {
         // 创建过滤器
         filewatch::FileWatcher::Filter filter;
         filter.setEventTypes({filewatch::EventType::kCreate, filewatch::EventType::kModify});
-        filter.setExtensions({"txt", "cpp"});
+        filter.setExtensions({".txt", ".cpp"});
         filter.setPathPattern(".*test.*");
 
         // 设置过滤器
@@ -432,5 +461,489 @@ TEST_CASE("FileWatcher class tests", "[FileWatcher]") {
         std::string cleanupCmd = "rm -rf \"" + tmpRoot + "\"";
         (void)std::system(cleanupCmd.c_str());
     }
+
+    SECTION("Single file watch") {
+        char tmpTemplate[] = "/tmp/filewatch_single_ut_XXXXXX";
+        char* created = mkdtemp(tmpTemplate);
+        REQUIRE(created != nullptr);
+        std::string baseDir(created);
+        std::string targetFile = baseDir + "/target.txt";
+
+        // 先创建文件
+        {
+            std::ofstream ofs(targetFile.c_str());
+            ofs << "initial";
+        }
+
+        filewatch::FileWatcher watcher(filewatch::LinuxBackend::INOTIFY);
+        std::vector<filewatch::FileEvent> captured;
+        std::mutex capturedMutex;
+
+        bool added = watcher.addWatch(targetFile, false, [&captured, &capturedMutex](const filewatch::FileEvent& event) {
+            std::lock_guard<std::mutex> lock(capturedMutex);
+            captured.push_back(event);
+        });
+        REQUIRE(added == true);
+
+        std::atomic<bool> started(false);
+        std::thread startThread([&watcher, &started]() {
+            started = watcher.start();
+        });
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+        // 修改文件
+        {
+            std::ofstream ofs(targetFile.c_str(), std::ios::app);
+            ofs << " appended content";
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+        // 删除文件
+        REQUIRE(::unlink(targetFile.c_str()) == 0);
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+        watcher.stop();
+        startThread.join();
+        REQUIRE(started == true);
+
+        bool sawModify = false;
+        bool sawDelete = false;
+        {
+            std::lock_guard<std::mutex> lock(capturedMutex);
+            for (const auto& e : captured) {
+                if (e.getType() == filewatch::EventType::kModify && e.getPath() == targetFile) {
+                    sawModify = true;
+                }
+                if (e.getType() == filewatch::EventType::kDelete && e.getPath() == targetFile) {
+                    sawDelete = true;
+                }
+            }
+        }
+        REQUIRE(sawModify == true);
+        REQUIRE(sawDelete == true);
+
+        ::rmdir(baseDir.c_str());
+    }
+
+    SECTION("Event filter in runtime FileWatcher") {
+        char tmpTemplate[] = "/tmp/filewatch_filter_ut_XXXXXX";
+        char* created = mkdtemp(tmpTemplate);
+        REQUIRE(created != nullptr);
+        std::string baseDir(created);
+        std::string logFile = baseDir + "/app.log";
+        std::string tmpFile = baseDir + "/app.tmp";
+
+        filewatch::FileWatcher watcher(filewatch::LinuxBackend::INOTIFY);
+        filewatch::FileWatcher::Filter filter;
+        filter.setExtensions({".log"});
+        watcher.setFilter(filter);
+
+        std::vector<filewatch::FileEvent> captured;
+        std::mutex capturedMutex;
+
+        bool added = watcher.addWatch(baseDir, false, [&captured, &capturedMutex](const filewatch::FileEvent& event) {
+            std::lock_guard<std::mutex> lock(capturedMutex);
+            captured.push_back(event);
+        });
+        REQUIRE(added == true);
+
+        std::atomic<bool> started(false);
+        std::thread startThread([&watcher, &started]() {
+            started = watcher.start();
+        });
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+        {
+            std::ofstream ofs(logFile.c_str());
+            ofs << "log entry";
+        }
+        {
+            std::ofstream ofs(tmpFile.c_str());
+            ofs << "temp entry";
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+
+        watcher.stop();
+        startThread.join();
+        REQUIRE(started == true);
+
+        bool sawLogFile = false;
+        bool sawTmpFile = false;
+        {
+            std::lock_guard<std::mutex> lock(capturedMutex);
+            for (const auto& e : captured) {
+                if (e.getPath() == logFile) {
+                    sawLogFile = true;
+                }
+                if (e.getPath() == tmpFile) {
+                    sawTmpFile = true;
+                }
+            }
+        }
+        REQUIRE(sawLogFile == true);
+        REQUIRE(sawTmpFile == false);
+
+        ::unlink(logFile.c_str());
+        ::unlink(tmpFile.c_str());
+        ::rmdir(baseDir.c_str());
+    }
+
+    SECTION("Debounce modifies in runtime") {
+        char tmpTemplate[] = "/tmp/filewatch_debounce_ut_XXXXXX";
+        char* created = mkdtemp(tmpTemplate);
+        REQUIRE(created != nullptr);
+        std::string baseDir(created);
+        std::string testFile = baseDir + "/burst.txt";
+
+        {
+            std::ofstream ofs(testFile.c_str());
+            ofs << "init";
+        }
+
+        filewatch::FileWatcher watcher(filewatch::LinuxBackend::INOTIFY);
+        std::atomic<int> modifyCount(0);
+
+        bool added = watcher.addWatch(baseDir, false, [&modifyCount, &testFile](const filewatch::FileEvent& event) {
+            if (event.getType() == filewatch::EventType::kModify && event.getPath() == testFile) {
+                ++modifyCount;
+            }
+        });
+        REQUIRE(added == true);
+
+        std::atomic<bool> started(false);
+        std::thread startThread([&watcher, &started]() {
+            started = watcher.start();
+        });
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+        // 连续快速追加写入 8 次（时间间隔极短，< 50ms debounce 窗口）
+        for (int i = 0; i < 8; ++i) {
+            std::ofstream ofs(testFile.c_str(), std::ios::app);
+            ofs << "x";
+            ofs.flush();
+            std::this_thread::sleep_for(std::chrono::milliseconds(3));
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+        watcher.stop();
+        startThread.join();
+        REQUIRE(started == true);
+
+        // 防抖生效后，收到的 modify 事件应该明显少于写入次数
+        REQUIRE(modifyCount.load() >= 1);
+        REQUIRE(modifyCount.load() < 8);
+
+        ::unlink(testFile.c_str());
+        ::rmdir(baseDir.c_str());
+    }
+
+    SECTION("Non-recursive directory watch does not capture events in subdirectories") {
+        char tmpTemplate[] = "/tmp/filewatch_nonrec_ut_XXXXXX";
+        char* created = mkdtemp(tmpTemplate);
+        REQUIRE(created != nullptr);
+        std::string baseDir(created);
+        std::string subDir = baseDir + "/subdir";
+        std::string rootFile = baseDir + "/root.txt";
+        std::string subFile = subDir + "/inner.txt";
+
+        REQUIRE(::mkdir(subDir.c_str(), 0755) == 0);
+
+        filewatch::FileWatcher watcher(filewatch::LinuxBackend::INOTIFY);
+        std::vector<filewatch::FileEvent> captured;
+        std::mutex capturedMutex;
+
+        // recursive = false
+        bool added = watcher.addWatch(baseDir, false, [&captured, &capturedMutex](const filewatch::FileEvent& event) {
+            std::lock_guard<std::mutex> lock(capturedMutex);
+            captured.push_back(event);
+        });
+        REQUIRE(added == true);
+
+        std::atomic<bool> started(false);
+        std::thread startThread([&watcher, &started]() {
+            started = watcher.start();
+        });
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+        {
+            std::ofstream ofs(rootFile.c_str());
+            ofs << "root";
+        }
+        {
+            std::ofstream ofs(subFile.c_str());
+            ofs << "sub";
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+        watcher.stop();
+        startThread.join();
+        REQUIRE(started == true);
+
+        bool sawRootFile = false;
+        bool sawSubFile = false;
+        {
+            std::lock_guard<std::mutex> lock(capturedMutex);
+            for (const auto& e : captured) {
+                if (e.getPath() == rootFile) {
+                    sawRootFile = true;
+                }
+                if (e.getPath() == subFile) {
+                    sawSubFile = true;
+                }
+            }
+        }
+
+        REQUIRE(sawRootFile == true);
+        REQUIRE(sawSubFile == false);
+
+        ::unlink(rootFile.c_str());
+        ::unlink(subFile.c_str());
+        ::rmdir(subDir.c_str());
+        ::rmdir(baseDir.c_str());
+    }
+
+    SECTION("addWatchWithRegex filters events in runtime") {
+        char tmpTemplate[] = "/tmp/filewatch_regex_ut_XXXXXX";
+        char* created = mkdtemp(tmpTemplate);
+        REQUIRE(created != nullptr);
+        std::string baseDir(created);
+        std::string matchFile = baseDir + "/important.log";
+        std::string ignoreFile = baseDir + "/ignore.txt";
+
+        filewatch::FileWatcher watcher(filewatch::LinuxBackend::INOTIFY);
+        std::vector<filewatch::FileEvent> captured;
+        std::mutex capturedMutex;
+
+        bool added = watcher.addWatchWithRegex(baseDir, R"(.*\.log$)", false, [&captured, &capturedMutex](const filewatch::FileEvent& event) {
+            std::lock_guard<std::mutex> lock(capturedMutex);
+            captured.push_back(event);
+        });
+        REQUIRE(added == true);
+
+        std::atomic<bool> started(false);
+        std::thread startThread([&watcher, &started]() {
+            started = watcher.start();
+        });
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+        {
+            std::ofstream ofs(matchFile.c_str());
+            ofs << "match";
+        }
+        {
+            std::ofstream ofs(ignoreFile.c_str());
+            ofs << "ignore";
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+        watcher.stop();
+        startThread.join();
+        REQUIRE(started == true);
+
+        bool sawMatch = false;
+        bool sawIgnore = false;
+        {
+            std::lock_guard<std::mutex> lock(capturedMutex);
+            for (const auto& e : captured) {
+                if (e.getPath() == matchFile) {
+                    sawMatch = true;
+                }
+                if (e.getPath() == ignoreFile) {
+                    sawIgnore = true;
+                }
+            }
+        }
+
+        REQUIRE(sawMatch == true);
+        REQUIRE(sawIgnore == false);
+
+        ::unlink(matchFile.c_str());
+        ::unlink(ignoreFile.c_str());
+        ::rmdir(baseDir.c_str());
+    }
+
+    SECTION("removeWatch stops delivering events in runtime") {
+        char tmpTemplate[] = "/tmp/filewatch_rmwatch_ut_XXXXXX";
+        char* created = mkdtemp(tmpTemplate);
+        REQUIRE(created != nullptr);
+        std::string baseDir(created);
+        std::string fileBefore = baseDir + "/before.txt";
+        std::string fileAfter = baseDir + "/after.txt";
+
+        filewatch::FileWatcher watcher(filewatch::LinuxBackend::INOTIFY);
+        std::vector<filewatch::FileEvent> captured;
+        std::mutex capturedMutex;
+
+        bool added = watcher.addWatch(baseDir, false, [&captured, &capturedMutex](const filewatch::FileEvent& event) {
+            std::lock_guard<std::mutex> lock(capturedMutex);
+            captured.push_back(event);
+        });
+        REQUIRE(added == true);
+
+        std::atomic<bool> started(false);
+        std::thread startThread([&watcher, &started]() {
+            started = watcher.start();
+        });
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+        // 移除前创建文件，应该被捕获
+        {
+            std::ofstream ofs(fileBefore.c_str());
+            ofs << "before";
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+        // 移除监控
+        REQUIRE(watcher.removeWatch(baseDir) == true);
+
+        // 移除后创建文件，不应该被捕获
+        {
+            std::ofstream ofs(fileAfter.c_str());
+            ofs << "after";
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+        watcher.stop();
+        startThread.join();
+        REQUIRE(started == true);
+
+        bool sawBefore = false;
+        bool sawAfter = false;
+        {
+            std::lock_guard<std::mutex> lock(capturedMutex);
+            for (const auto& e : captured) {
+                if (e.getPath() == fileBefore) {
+                    sawBefore = true;
+                }
+                if (e.getPath() == fileAfter) {
+                    sawAfter = true;
+                }
+            }
+        }
+
+        REQUIRE(sawBefore == true);
+        REQUIRE(sawAfter == false);
+
+        ::unlink(fileBefore.c_str());
+        ::unlink(fileAfter.c_str());
+        ::rmdir(baseDir.c_str());
+    }
 #endif
+}
+
+// 测试 FileWatcher::Filter 类
+TEST_CASE("Filter class tests", "[Filter]") {
+    SECTION("Default filter passes everything") {
+        filewatch::FileWatcher::Filter filter;
+        filewatch::FileEvent fileEv(filewatch::EventType::kCreate, "/path/to/test.txt", filewatch::PathType::FILE);
+        filewatch::FileEvent dirEv(filewatch::EventType::kDelete, "/path/to/dir", filewatch::PathType::DIRECTORY);
+        REQUIRE(filter.passes(fileEv) == true);
+        REQUIRE(filter.passes(dirEv) == true);
+    }
+
+    SECTION("Event types filtering") {
+        filewatch::FileWatcher::Filter filter;
+        filter.setEventTypes({filewatch::EventType::kModify, filewatch::EventType::kDelete});
+
+        filewatch::FileEvent evCreate(filewatch::EventType::kCreate, "/test.txt", filewatch::PathType::FILE);
+        filewatch::FileEvent evModify(filewatch::EventType::kModify, "/test.txt", filewatch::PathType::FILE);
+        filewatch::FileEvent evDelete(filewatch::EventType::kDelete, "/test.txt", filewatch::PathType::FILE);
+        filewatch::FileEvent evRename(filewatch::EventType::kRename, "/new.txt", filewatch::PathType::FILE, "/old.txt");
+
+        REQUIRE(filter.passes(evCreate) == false);
+        REQUIRE(filter.passes(evModify) == true);
+        REQUIRE(filter.passes(evDelete) == true);
+        REQUIRE(filter.passes(evRename) == false);
+    }
+
+    SECTION("Extensions filtering") {
+        filewatch::FileWatcher::Filter filter;
+        filter.setExtensions({".txt", ".log"});
+
+        filewatch::FileEvent evTxt(filewatch::EventType::kCreate, "file.txt", filewatch::PathType::FILE);
+        filewatch::FileEvent evLog(filewatch::EventType::kModify, "/path/to/file.log", filewatch::PathType::FILE);
+        filewatch::FileEvent evCpp(filewatch::EventType::kCreate, "file.cpp", filewatch::PathType::FILE);
+        filewatch::FileEvent evNoExt(filewatch::EventType::kCreate, "file_without_ext", filewatch::PathType::FILE);
+        // 目录不受文件扩展名限制
+        filewatch::FileEvent evDir(filewatch::EventType::kCreate, "/path/to/folder.txt", filewatch::PathType::DIRECTORY);
+
+        REQUIRE(filter.passes(evTxt) == true);
+        REQUIRE(filter.passes(evLog) == true);
+        REQUIRE(filter.passes(evCpp) == false);
+        REQUIRE(filter.passes(evNoExt) == false);
+        REQUIRE(filter.passes(evDir) == true);
+    }
+
+    SECTION("Path pattern filtering") {
+        filewatch::FileWatcher::Filter filter;
+        filter.setPathPattern(".*\\.cpp$");
+
+        filewatch::FileEvent evCpp(filewatch::EventType::kCreate, "/src/main.cpp", filewatch::PathType::FILE);
+        filewatch::FileEvent evH(filewatch::EventType::kCreate, "/src/main.h", filewatch::PathType::FILE);
+
+        REQUIRE(filter.passes(evCpp) == true);
+        REQUIRE(filter.passes(evH) == false);
+
+        // 测试非法正则表达式不会导致崩溃，并自动禁用模式匹配
+        filter.setPathPattern("[invalid(regex");
+        REQUIRE(filter.passes(evH) == true);
+    }
+
+    SECTION("Combined filters and chaining") {
+        filewatch::FileWatcher::Filter filter;
+        filter.setEventTypes({filewatch::EventType::kModify})
+              .setExtensions({".txt"})
+              .setPathPattern(".*/data/.*");
+
+        filewatch::FileEvent matchEv(filewatch::EventType::kModify, "/root/data/file.txt", filewatch::PathType::FILE);
+        filewatch::FileEvent diffType(filewatch::EventType::kCreate, "/root/data/file.txt", filewatch::PathType::FILE);
+        filewatch::FileEvent diffExt(filewatch::EventType::kModify, "/root/data/file.doc", filewatch::PathType::FILE);
+        filewatch::FileEvent diffPath(filewatch::EventType::kModify, "/root/other/file.txt", filewatch::PathType::FILE);
+
+        REQUIRE(filter.passes(matchEv) == true);
+        REQUIRE(filter.passes(diffType) == false);
+        REQUIRE(filter.passes(diffExt) == false);
+        REQUIRE(filter.passes(diffPath) == false);
+    }
+}
+
+// 测试错误码与错误分类 (errc & watcher_error_category)
+TEST_CASE("Error category and error code tests", "[Error]") {
+    SECTION("watcher_category singleton and properties") {
+        const auto& cat1 = filewatch::errc::watcher_category();
+        const auto& cat2 = filewatch::errc::watcher_category();
+        REQUIRE(&cat1 == &cat2);
+        REQUIRE(std::string(cat1.name()) == "filewatch");
+    }
+
+    SECTION("Error messages mapping") {
+        const auto& cat = filewatch::errc::watcher_category();
+        REQUIRE(cat.message(static_cast<int>(filewatch::errc::watcher_errc::success)) == "success");
+        REQUIRE(cat.message(static_cast<int>(filewatch::errc::watcher_errc::invalid_path)) == "invalid path");
+        REQUIRE(cat.message(static_cast<int>(filewatch::errc::watcher_errc::path_not_exist)) == "path does not exist");
+        REQUIRE(cat.message(static_cast<int>(filewatch::errc::watcher_errc::permission_denied)) == "permission denied");
+        REQUIRE(cat.message(static_cast<int>(filewatch::errc::watcher_errc::platform_error)) == "platform error");
+        REQUIRE(cat.message(static_cast<int>(filewatch::errc::watcher_errc::regex_error)) == "regex error");
+        REQUIRE(cat.message(static_cast<int>(filewatch::errc::watcher_errc::internal_error)) == "internal error");
+        REQUIRE(cat.message(static_cast<int>(filewatch::errc::watcher_errc::already_watching)) == "already watching");
+        REQUIRE(cat.message(static_cast<int>(filewatch::errc::watcher_errc::watcher_not_started)) == "watcher not started");
+        REQUIRE(cat.message(static_cast<int>(filewatch::errc::watcher_errc::watcher_already_running)) == "watcher already running");
+        REQUIRE(cat.message(static_cast<int>(filewatch::errc::watcher_errc::unknown_error)) == "unknown error");
+        REQUIRE(cat.message(99999) == "unknown error");
+    }
+
+    SECTION("make_error_code and std::error_code integration") {
+        std::error_code ec = filewatch::make_error_code(filewatch::errc::watcher_errc::path_not_exist);
+        REQUIRE(ec.value() == static_cast<int>(filewatch::errc::watcher_errc::path_not_exist));
+        REQUIRE(ec.category() == filewatch::errc::watcher_category());
+        REQUIRE(ec == filewatch::errc::watcher_errc::path_not_exist);
+        REQUIRE(ec.message() == "path does not exist");
+    }
 }
