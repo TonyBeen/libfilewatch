@@ -9,6 +9,8 @@
 
 #ifdef __linux__
 #include <sys/fanotify.h>
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <unistd.h>
 #include <errno.h>
 #include <limits.h>
@@ -20,23 +22,66 @@ namespace filewatch {
 
 class FanotifyWatcher : public PlatformWatcher {
 private:
+    int m_epollFd;
     int m_fanotifyFd;
+    int m_wakeupFd;
+    std::function<int64_t()> m_nextTimeoutProvider;
+    std::function<void()> m_timerExpiryHandler;
     std::atomic<bool> m_running;
     std::function<void(const FileEvent&)> m_callback;
 
 public:
     explicit FanotifyWatcher(std::function<void(const FileEvent&)> callback)
-        : m_fanotifyFd(-1), m_running(false), m_callback(callback) {
+        : m_epollFd(-1), m_fanotifyFd(-1), m_wakeupFd(-1), m_running(false), m_callback(callback) {
+        m_epollFd = epoll_create1(EPOLL_CLOEXEC);
         m_fanotifyFd = fanotify_init(FAN_CLOEXEC | FAN_NONBLOCK, O_RDONLY);
+        m_wakeupFd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+
+        if (m_epollFd >= 0) {
+            if (m_fanotifyFd >= 0) {
+                struct epoll_event ev;
+                ev.events = EPOLLIN;
+                ev.data.fd = m_fanotifyFd;
+                epoll_ctl(m_epollFd, EPOLL_CTL_ADD, m_fanotifyFd, &ev);
+            }
+            if (m_wakeupFd >= 0) {
+                struct epoll_event ev;
+                ev.events = EPOLLIN;
+                ev.data.fd = m_wakeupFd;
+                epoll_ctl(m_epollFd, EPOLL_CTL_ADD, m_wakeupFd, &ev);
+            }
+        }
     }
 
     ~FanotifyWatcher() {
         if (m_running) {
             stop();
         }
+        if (m_epollFd != -1) {
+            close(m_epollFd);
+            m_epollFd = -1;
+        }
         if (m_fanotifyFd != -1) {
             close(m_fanotifyFd);
+            m_fanotifyFd = -1;
         }
+        if (m_wakeupFd != -1) {
+            close(m_wakeupFd);
+            m_wakeupFd = -1;
+        }
+    }
+
+    void wakeup() override {
+        if (m_wakeupFd != -1) {
+            uint64_t one = 1;
+            (void)write(m_wakeupFd, &one, sizeof(one));
+        }
+    }
+
+    void setTimerHandlers(std::function<int64_t()> nextTimeoutProvider,
+                          std::function<void()> expiryHandler) override {
+        m_nextTimeoutProvider = std::move(nextTimeoutProvider);
+        m_timerExpiryHandler = std::move(expiryHandler);
     }
 
     bool addWatch(const std::string& path, bool recursive) override {
@@ -68,7 +113,7 @@ public:
     }
 
     bool start() override {
-        if (m_running || m_fanotifyFd == -1) {
+        if (m_running || m_epollFd == -1 || m_fanotifyFd == -1) {
             return false;
         }
 
@@ -83,28 +128,54 @@ public:
         }
 
         m_running = false;
+        wakeup();
     }
 
 private:
     void watchLoop() {
         char buffer[4096];
+        struct epoll_event events[32];
+
         while (m_running) {
-            int len = read(m_fanotifyFd, buffer, sizeof(buffer));
-            if (len == -1) {
-                if (errno != EAGAIN) {
-                    break;
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                continue;
+            int64_t timeoutMs = 1000;
+            if (m_nextTimeoutProvider) {
+                timeoutMs = m_nextTimeoutProvider();
+                if (timeoutMs < 0) timeoutMs = 0;
+                if (timeoutMs > 1000) timeoutMs = 1000;
             }
 
-            // 处理 fanotify 事件
-            struct fanotify_event_metadata* metadata;
-            for (char* p = buffer; p < buffer + len;) {
-                metadata = reinterpret_cast<struct fanotify_event_metadata*>(p);
-                processEvent(metadata);
-                p += metadata->event_len;
+            int nfds = epoll_wait(m_epollFd, events, 32, static_cast<int>(timeoutMs));
+            if (nfds < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                break;
             }
+
+            for (int i = 0; i < nfds; ++i) {
+                const int fd = events[i].data.fd;
+                if (fd == m_wakeupFd) {
+                    uint64_t val = 0;
+                    while (read(m_wakeupFd, &val, sizeof(val)) > 0) {}
+                } else if (fd == m_fanotifyFd) {
+                    int len = read(m_fanotifyFd, buffer, sizeof(buffer));
+                    if (len > 0) {
+                        for (char* p = buffer; p < buffer + len;) {
+                            struct fanotify_event_metadata* metadata = reinterpret_cast<struct fanotify_event_metadata*>(p);
+                            processEvent(metadata);
+                            p += metadata->event_len;
+                        }
+                    }
+                }
+            }
+
+            if (m_timerExpiryHandler) {
+                m_timerExpiryHandler();
+            }
+        }
+
+        if (m_timerExpiryHandler) {
+            m_timerExpiryHandler();
         }
     }
 

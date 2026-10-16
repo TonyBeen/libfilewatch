@@ -10,7 +10,7 @@
 
 #ifdef __linux__
 #include <sys/inotify.h>
-#include <sys/poll.h>
+#include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <unistd.h>
 #include <errno.h>
@@ -21,6 +21,7 @@ namespace filewatch {
 
 class InotifyWatcher : public PlatformWatcher {
 private:
+    int m_epollFd;
     int m_inotifyFd;
     int m_wakeupFd;
     std::unordered_map<int, std::string>    m_watchMap;         // watch descriptor -> path
@@ -41,14 +42,34 @@ private:
 
 public:
     explicit InotifyWatcher(std::function<void(const FileEvent&)> callback)
-        : m_inotifyFd(-1), m_wakeupFd(-1), m_running(false), m_callback(callback) {
-        m_inotifyFd = inotify_init1(IN_NONBLOCK);
+        : m_epollFd(-1), m_inotifyFd(-1), m_wakeupFd(-1), m_running(false), m_callback(callback) {
+        m_epollFd = epoll_create1(EPOLL_CLOEXEC);
+        m_inotifyFd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
         m_wakeupFd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+
+        if (m_epollFd >= 0) {
+            if (m_inotifyFd >= 0) {
+                struct epoll_event ev;
+                ev.events = EPOLLIN;
+                ev.data.fd = m_inotifyFd;
+                epoll_ctl(m_epollFd, EPOLL_CTL_ADD, m_inotifyFd, &ev);
+            }
+            if (m_wakeupFd >= 0) {
+                struct epoll_event ev;
+                ev.events = EPOLLIN;
+                ev.data.fd = m_wakeupFd;
+                epoll_ctl(m_epollFd, EPOLL_CTL_ADD, m_wakeupFd, &ev);
+            }
+        }
     }
 
     ~InotifyWatcher() {
         if (m_running) {
             stop();
+        }
+        if (m_epollFd != -1) {
+            close(m_epollFd);
+            m_epollFd = -1;
         }
         if (m_inotifyFd != -1) {
             close(m_inotifyFd);
@@ -121,7 +142,7 @@ public:
     }
 
     bool start() override {
-        if (m_running || m_inotifyFd == -1) {
+        if (m_running || m_epollFd == -1 || m_inotifyFd == -1) {
             return false;
         }
 
@@ -198,11 +219,7 @@ private:
 
     void watchLoop() {
         char buffer[64 * 1024];
-        struct pollfd fds[2];
-        fds[0].fd = m_inotifyFd;
-        fds[0].events = POLLIN;
-        fds[1].fd = m_wakeupFd;
-        fds[1].events = POLLIN;
+        struct epoll_event events[32];
 
         while (m_running) {
             int64_t timeoutMs = 1000;
@@ -212,33 +229,33 @@ private:
                 if (timeoutMs > 1000) timeoutMs = 1000;
             }
 
-            int nfds = (m_wakeupFd != -1) ? 2 : 1;
-            int ret = poll(fds, nfds, static_cast<int>(timeoutMs));
-            if (ret < 0) {
+            int nfds = epoll_wait(m_epollFd, events, 32, static_cast<int>(timeoutMs));
+            if (nfds < 0) {
                 if (errno == EINTR) {
                     continue;
                 }
                 break;
             }
 
-            if (m_wakeupFd != -1 && (fds[1].revents & POLLIN)) {
-                uint64_t val = 0;
-                while (read(m_wakeupFd, &val, sizeof(val)) > 0) {}
-            }
-
-            if (fds[0].revents & POLLIN) {
-                int len = read(m_inotifyFd, buffer, sizeof(buffer));
-                if (len > 0) {
-                    char* p = buffer;
-                    char* end = buffer + len;
-                    while (p + static_cast<int>(sizeof(struct inotify_event)) <= end) {
-                        struct inotify_event* event = reinterpret_cast<struct inotify_event*>(p);
-                        const size_t eventSize = sizeof(struct inotify_event) + event->len;
-                        if (p + static_cast<int>(eventSize) > end) {
-                            break;
+            for (int i = 0; i < nfds; ++i) {
+                const int fd = events[i].data.fd;
+                if (fd == m_wakeupFd) {
+                    uint64_t val = 0;
+                    while (read(m_wakeupFd, &val, sizeof(val)) > 0) {}
+                } else if (fd == m_inotifyFd) {
+                    int len = read(m_inotifyFd, buffer, sizeof(buffer));
+                    if (len > 0) {
+                        char* p = buffer;
+                        char* end = buffer + len;
+                        while (p + static_cast<int>(sizeof(struct inotify_event)) <= end) {
+                            struct inotify_event* event = reinterpret_cast<struct inotify_event*>(p);
+                            const size_t eventSize = sizeof(struct inotify_event) + event->len;
+                            if (p + static_cast<int>(eventSize) > end) {
+                                break;
+                            }
+                            processEvent(event);
+                            p += eventSize;
                         }
-                        processEvent(event);
-                        p += eventSize;
                     }
                 }
             }
