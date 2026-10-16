@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux (Ubuntu - Release)
+            os: ubuntu-latest
+            build_type: Release
+          - name: Linux (Ubuntu - Debug)
+            os: ubuntu-latest
+            build_type: Debug
+          - name: macOS (AppleClang - Release)
+            os: macos-latest
+            build_type: Release
+          - name: Windows (MSVC - Release)
+            os: windows-latest
+            build_type: Release
+          - name: Windows (MSVC - Debug)
+            os: windows-latest
+            build_type: Debug
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure CMake
+        run: >
+          cmake -B build -S .
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DBUILD_TESTS=ON
+          -DBUILD_EXAMPLES=ON
+
+      - name: Build
+        run: cmake --build build --config ${{ matrix.build_type }} --parallel
+
+      - name: Run Tests
+        run: ctest --test-dir build --output-on-failure -C ${{ matrix.build_type }}
