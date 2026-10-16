@@ -16,8 +16,6 @@
 #include <CoreServices/CoreServices.h>
 #include <sys/event.h>
 #include <sys/time.h>
-#include <sys/socket.h>
-#include <sys/select.h>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -25,6 +23,8 @@ namespace filewatch {
 
 class MacOSWatcher : public PlatformWatcher {
 private:
+    static const uintptr_t WAKEUP_IDENT = 1;
+
     // 递归监控列表（使用 FSEvents）
     std::vector<std::string> m_fseventsWatchList;
     FSEventStreamRef m_eventStream;
@@ -32,7 +32,7 @@ private:
     std::unordered_map<std::string, PathType> m_knownPathTypes;
     std::mutex m_knownPathsMutex;
 
-    // 非递归监控项（使用 kqueue 独占线程）
+    // 非递归监控项（使用主线程 kqueue 原生监听）
     struct DirectChildSnapshot {
         PathType type;
         time_t mtime;
@@ -52,11 +52,8 @@ private:
     std::unordered_map<int, std::shared_ptr<KqItem> > m_kqFdMap; // 包含主 fd 和直接子文件 fd
     std::unordered_map<int, std::string> m_childFdToPath; // 子文件 fd 映射到路径
     std::mutex m_kqMutex;
-    std::thread m_kqThread;
-    std::atomic<bool> m_kqRunning;
 
-    // Local Unix Socket 用于工作线程向主线程同步并唤醒
-    int m_spFds[2]; // [0]: 主线程读, [1]: 工作线程写
+    // FSEvents 异步事件队列（主线程中消费派发）
     std::vector<FileEvent> m_pendingEvents;
     std::mutex m_eventQueueMutex;
 
@@ -71,23 +68,28 @@ public:
     explicit MacOSWatcher(std::function<void(const FileEvent&)> callback)
         : m_eventStream(nullptr),
           m_kqFd(-1),
-          m_kqRunning(false),
           m_running(false),
           m_callback(callback) {
-        m_spFds[0] = -1;
-        m_spFds[1] = -1;
+        m_kqFd = kqueue();
+        if (m_kqFd >= 0) {
+            struct kevent change;
+            EV_SET(&change, WAKEUP_IDENT, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, nullptr);
+            kevent(m_kqFd, &change, 1, nullptr, 0, nullptr);
+        }
     }
 
     ~MacOSWatcher() {
         if (m_running) {
             stop();
         }
+        closeKqueue();
     }
 
     void wakeup() override {
-        if (m_spFds[1] != -1) {
-            char sig = 1;
-            (void)write(m_spFds[1], &sig, 1);
+        if (m_kqFd >= 0) {
+            struct kevent trigger;
+            EV_SET(&trigger, WAKEUP_IDENT, EVFILT_USER, 0, NOTE_TRIGGER, 0, nullptr);
+            kevent(m_kqFd, &trigger, 1, nullptr, 0, nullptr);
         }
     }
 
@@ -114,8 +116,12 @@ public:
             // 递归目录：使用 FSEvents 引擎
             m_fseventsWatchList.push_back(path);
             rememberExistingPathTree(path);
+            if (m_running) {
+                stopFSEvents();
+                startFSEvents();
+            }
         } else {
-            // 非递归目录或单文件：使用 kqueue 引擎
+            // 非递归目录或单文件：使用 kqueue 原生监听
             if (!addKqueueItem(path, isDir)) {
                 return false;
             }
@@ -130,6 +136,10 @@ public:
         auto itFs = std::find(m_fseventsWatchList.begin(), m_fseventsWatchList.end(), path);
         if (itFs != m_fseventsWatchList.end()) {
             m_fseventsWatchList.erase(itFs);
+            if (m_running) {
+                stopFSEvents();
+                startFSEvents();
+            }
             return true;
         }
 
@@ -138,25 +148,13 @@ public:
     }
 
     bool start() override {
-        if (m_running) {
+        if (m_running || m_kqFd < 0) {
             return false;
         }
-
-        // 创建用于跨线程同步通知的 local unix socketpair
-        if (socketpair(AF_UNIX, SOCK_STREAM, 0, m_spFds) != 0) {
-            return false;
-        }
-
-        // 设置非阻塞
-        fcntl(m_spFds[0], F_SETFL, O_NONBLOCK);
-        fcntl(m_spFds[1], F_SETFL, O_NONBLOCK);
 
         m_running = true;
 
-        // 启动 kqueue 独占线程
-        startKqueueThread();
-
-        // 进入主事件循环（主线程）
+        // 进入主事件循环（由当前主线程执行，零额外独占线程）
         watchLoop();
 
         return true;
@@ -169,27 +167,11 @@ public:
 
         m_running = false;
 
-        // 1. 停止 kqueue 线程
-        stopKqueueThread();
-
-        // 2. 停止 FSEvents 流
+        // 停止 FSEvents 流
         stopFSEvents();
 
-        // 3. 唤醒主线程退出 select
-        if (m_spFds[1] != -1) {
-            char sig = 1;
-            (void)write(m_spFds[1], &sig, 1);
-        }
-
-        // 4. 关闭 socketpair
-        if (m_spFds[0] != -1) {
-            close(m_spFds[0]);
-            m_spFds[0] = -1;
-        }
-        if (m_spFds[1] != -1) {
-            close(m_spFds[1]);
-            m_spFds[1] = -1;
-        }
+        // 唤醒主线程退出 kevent
+        wakeup();
     }
 
 private:
@@ -198,10 +180,7 @@ private:
             std::lock_guard<std::mutex> lock(m_eventQueueMutex);
             m_pendingEvents.push_back(event);
         }
-        if (m_spFds[1] != -1) {
-            char sig = 1;
-            (void)write(m_spFds[1], &sig, 1);
-        }
+        wakeup();
     }
 
     void pushEventsToMainThread(const std::vector<FileEvent>& events) {
@@ -212,10 +191,7 @@ private:
             std::lock_guard<std::mutex> lock(m_eventQueueMutex);
             m_pendingEvents.insert(m_pendingEvents.end(), events.begin(), events.end());
         }
-        if (m_spFds[1] != -1) {
-            char sig = 1;
-            (void)write(m_spFds[1], &sig, 1);
-        }
+        wakeup();
     }
 
     void dispatchPendingEventsOnMainThread() {
@@ -386,37 +362,7 @@ private:
         kevent(m_kqFd, &change, 1, nullptr, 0, nullptr);
     }
 
-    void startKqueueThread() {
-        if (m_kqFd < 0) {
-            m_kqFd = kqueue();
-        }
-        if (m_kqFd < 0) {
-            return;
-        }
-
-        // 注册已添加的项
-        {
-            std::lock_guard<std::mutex> lock(m_kqMutex);
-            for (const auto& pair : m_kqWatches) {
-                registerKevent(pair.second);
-                if (pair.second->isDirectory) {
-                    syncDirectChildFileWatches(pair.second);
-                }
-            }
-        }
-
-        m_kqRunning = true;
-        m_kqThread = std::thread([this]() {
-            kqueueLoop();
-        });
-    }
-
-    void stopKqueueThread() {
-        m_kqRunning = false;
-        if (m_kqThread.joinable()) {
-            m_kqThread.join();
-        }
-
+    void closeKqueue() {
         std::lock_guard<std::mutex> lock(m_kqMutex);
         for (const auto& pair : m_kqWatches) {
             for (const auto& cpair : pair.second->childFileFds) {
@@ -430,30 +376,13 @@ private:
                 pair.second->fd = -1;
             }
         }
+        m_kqWatches.clear();
         m_kqFdMap.clear();
         m_childFdToPath.clear();
 
         if (m_kqFd >= 0) {
             close(m_kqFd);
             m_kqFd = -1;
-        }
-    }
-
-    void kqueueLoop() {
-        struct kevent events[32];
-        while (m_kqRunning) {
-            struct timespec timeout = { 0, 100000000 }; // 100ms
-            int nev = kevent(m_kqFd, nullptr, 0, events, 32, &timeout);
-            if (nev < 0) {
-                if (errno == EINTR) {
-                    continue;
-                }
-                break;
-            }
-
-            for (int i = 0; i < nev; ++i) {
-                handleKevent(events[i]);
-            }
         }
     }
 
@@ -860,19 +789,17 @@ private:
     }
 
     // ==========================================
-    // 主线程统一事件循环
+    // 主线程统一事件循环（以 kevent 为唯一核心）
     // ==========================================
     void watchLoop() {
         startFSEvents();
 
+        struct kevent events[64];
+
         while (m_running) {
-            if (m_spFds[0] == -1) {
+            if (m_kqFd < 0) {
                 break;
             }
-
-            fd_set readfds;
-            FD_ZERO(&readfds);
-            FD_SET(m_spFds[0], &readfds);
 
             int64_t timeoutMs = 1000;
             if (m_nextTimeoutProvider) {
@@ -881,17 +808,27 @@ private:
                 if (timeoutMs > 1000) timeoutMs = 1000;
             }
 
-            struct timeval tv;
-            tv.tv_sec = timeoutMs / 1000;
-            tv.tv_usec = (timeoutMs % 1000) * 1000;
+            struct timespec ts;
+            ts.tv_sec = timeoutMs / 1000;
+            ts.tv_nsec = (timeoutMs % 1000) * 1000000;
 
-            int ret = select(m_spFds[0] + 1, &readfds, nullptr, nullptr, &tv);
-            if (ret > 0 && FD_ISSET(m_spFds[0], &readfds)) {
-                char drainBuf[128];
-                while (read(m_spFds[0], drainBuf, sizeof(drainBuf)) > 0) {}
+            int nev = kevent(m_kqFd, nullptr, 0, events, 64, &ts);
+            if (nev < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                break;
             }
 
-            // 统一在主线程中按序派发所有事件
+            // 在当前主线程中原地处理所有触发的内核 VNODE 事件
+            for (int i = 0; i < nev; ++i) {
+                if (events[i].filter == EVFILT_VNODE) {
+                    handleKevent(events[i]);
+                }
+                // 若 events[i].filter == EVFILT_USER，由 wakeup() 触发，用于唤醒循环
+            }
+
+            // 统一在主线程中按序派发所有事件（来自 VNODE 与后台 FSEvents）
             dispatchPendingEventsOnMainThread();
 
             // 统一在主线程中按序派发到期定时器
