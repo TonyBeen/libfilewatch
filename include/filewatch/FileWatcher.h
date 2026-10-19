@@ -158,6 +158,35 @@ public:
         Filter& setPathPattern(const std::string& pattern);
 
         /**
+         * 添加路径排除正则表达式（黑名单）
+         * 支持匹配任意层级的目录名或文件名，命中即过滤丢弃
+         * @param pattern 正则表达式（如 R"((^|[/\\])build-[^/\\]+([/\\]|$))" 或 R"(\.git)")
+         * @return 过滤器本身（链式调用）
+         */
+        Filter& addExcludePattern(const std::string& pattern);
+
+        /**
+         * 批量设置路径排除正则表达式（黑名单）
+         * @param patterns 正则表达式列表
+         * @return 过滤器本身（链式调用）
+         */
+        Filter& setExcludePatterns(const std::vector<std::string>& patterns);
+
+        /**
+         * 添加固定路径排除（黑名单，前缀精确匹配）
+         * @param path 要排除的目录路径或前缀
+         * @return 过滤器本身（链式调用）
+         */
+        Filter& addExcludePath(const std::string& path);
+
+        /**
+         * 批量设置固定路径排除（黑名单）
+         * @param paths 路径列表
+         * @return 过滤器本身（链式调用）
+         */
+        Filter& setExcludePaths(const std::vector<std::string>& paths);
+
+        /**
          * 检查事件是否通过过滤
          * @param event 要检查的事件
          * @return 是否通过过滤
@@ -169,6 +198,8 @@ public:
         std::vector<std::string>    m_extensions;
         std::regex                  m_pathPattern;
         bool                        m_hasPathPattern = false;
+        std::vector<std::regex>     m_excludePatterns;
+        std::vector<std::string>    m_excludePaths;
     };
 
     /**

@@ -6,6 +6,7 @@
 #include <chrono>
 #include <functional>
 #include <unordered_map>
+#include <unordered_set>
 #include <cstring>
 
 #ifdef __linux__
@@ -24,9 +25,20 @@ private:
     int m_epollFd;
     int m_inotifyFd;
     int m_wakeupFd;
-    std::unordered_map<int, std::string>    m_watchMap;         // watch descriptor -> path
-    std::unordered_map<std::string, int>    m_pathWatchMap;     // path -> watch descriptor
-    std::unordered_map<int, bool>           m_watchRecursive;   // watch descriptor -> recursive
+
+    // 记录用户显式添加的根监控任务及其关联的所有 wd（根自身以及派生的所有子目录）
+    struct RootWatch {
+        std::string rootPath;
+        bool recursive;
+        std::unordered_set<int> associatedWds;
+    };
+
+    std::unordered_map<int, std::string>                     m_watchMap;         // watch descriptor -> path
+    std::unordered_map<std::string, int>                     m_pathWatchMap;     // path -> watch descriptor
+    std::unordered_map<int, bool>                            m_watchRecursive;   // watch descriptor -> recursive
+    std::unordered_map<std::string, RootWatch>               m_rootWatches;      // rootPath -> RootWatch
+    std::unordered_map<int, std::unordered_set<std::string>> m_wdToRoots;        // wd -> rootPaths
+
     std::function<int64_t()>                m_nextTimeoutProvider;
     std::function<void()>                   m_timerExpiryHandler;
     std::atomic<bool>                       m_running;
@@ -39,6 +51,14 @@ private:
         PathType oldPathType;
     };
     std::unordered_map<uint32_t, RenameInfo> m_renameMap; // cookie -> rename info
+
+    static std::string normalizePath(const std::string& path) {
+        std::string p = path;
+        while (p.size() > 1 && p.back() == '/') {
+            p.pop_back();
+        }
+        return p;
+    }
 
 public:
     explicit InotifyWatcher(std::function<void(const FileEvent&)> callback)
@@ -67,6 +87,17 @@ public:
         if (m_running) {
             stop();
         }
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            for (const auto& pair : m_watchMap) {
+                inotify_rm_watch(m_inotifyFd, pair.first);
+            }
+            m_watchMap.clear();
+            m_pathWatchMap.clear();
+            m_watchRecursive.clear();
+            m_rootWatches.clear();
+            m_wdToRoots.clear();
+        }
         if (m_epollFd != -1) {
             close(m_epollFd);
             m_epollFd = -1;
@@ -84,7 +115,8 @@ public:
     void wakeup() override {
         if (m_wakeupFd != -1) {
             uint64_t one = 1;
-            (void)write(m_wakeupFd, &one, sizeof(one));
+            ssize_t ret = write(m_wakeupFd, &one, sizeof(one));
+            (void)ret;
         }
     }
 
@@ -99,24 +131,26 @@ public:
             return false;
         }
 
-        // TODO 可以优化为先检查路径是否已被监控，避免重复添加。
-
-        int wd = inotify_add_watch(m_inotifyFd, path.c_str(), 
-            IN_CREATE | IN_CLOSE_WRITE | IN_DELETE | IN_DELETE_SELF | IN_MOVED_FROM | IN_MOVED_TO);
-        if (wd == -1) {
-            return false;
-        }
+        const std::string normPath = normalizePath(path);
 
         {
             std::lock_guard<std::mutex> lock(m_mutex);
-            m_watchMap[wd] = path;
-            m_pathWatchMap[path] = wd;
-            m_watchRecursive[wd] = recursive;
+            RootWatch rw;
+            rw.rootPath = normPath;
+            rw.recursive = recursive;
+            m_rootWatches[normPath] = rw;
+        }
+
+        int wd = addDirectoryWatch(normPath, normPath, recursive);
+        if (wd == -1) {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_rootWatches.erase(normPath);
+            return false;
         }
 
         // 递归监控子目录
         if (recursive) {
-            addRecursiveWatches(path, true);
+            addRecursiveWatches(normPath, normPath);
         }
 
         return true;
@@ -127,17 +161,51 @@ public:
             return false;
         }
 
-        std::lock_guard<std::mutex> lock(m_mutex);
-        std::unordered_map<std::string, int>::iterator pathIt = m_pathWatchMap.find(path);
-        if (pathIt == m_pathWatchMap.end()) {
-            return false;
+        const std::string normPath = normalizePath(path);
+        std::vector<int> wdsToRemove;
+
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            auto rootIt = m_rootWatches.find(normPath);
+            if (rootIt != m_rootWatches.end()) {
+                // 是显式添加的根监控，遍历其所有派生关联的 wd
+                for (int wd : rootIt->second.associatedWds) {
+                    auto wdRootsIt = m_wdToRoots.find(wd);
+                    if (wdRootsIt != m_wdToRoots.end()) {
+                        wdRootsIt->second.erase(normPath);
+                        if (wdRootsIt->second.empty()) {
+                            m_wdToRoots.erase(wdRootsIt);
+                            wdsToRemove.push_back(wd);
+                        }
+                    }
+                }
+                m_rootWatches.erase(rootIt);
+            } else {
+                // 如果未在 rootWatches 中找到，按单个路径兜底处理
+                auto pathIt = m_pathWatchMap.find(normPath);
+                if (pathIt == m_pathWatchMap.end()) {
+                    return false;
+                }
+                int wd = pathIt->second;
+                auto wdRootsIt = m_wdToRoots.find(wd);
+                if (wdRootsIt != m_wdToRoots.end()) {
+                    m_wdToRoots.erase(wdRootsIt);
+                }
+                wdsToRemove.push_back(wd);
+            }
+
+            // 统一释放已无根任务引用的内核 watch 描述符与内部映射
+            for (int wd : wdsToRemove) {
+                inotify_rm_watch(m_inotifyFd, wd);
+                auto it = m_watchMap.find(wd);
+                if (it != m_watchMap.end()) {
+                    m_pathWatchMap.erase(it->second);
+                    m_watchMap.erase(it);
+                }
+                m_watchRecursive.erase(wd);
+            }
         }
 
-        const int wd = pathIt->second;
-        inotify_rm_watch(m_inotifyFd, wd);
-        m_watchRecursive.erase(wd);
-        m_watchMap.erase(wd);
-        m_pathWatchMap.erase(pathIt);
         return true;
     }
 
@@ -161,27 +229,51 @@ public:
     }
 
 private:
-    bool isPathWatched(const std::string& path) {
+    int addDirectoryWatch(const std::string& path, const std::string& rootPath, bool recursive) {
         std::lock_guard<std::mutex> lock(m_mutex);
-        return m_pathWatchMap.find(path) != m_pathWatchMap.end();
+        int wd = -1;
+        auto pathIt = m_pathWatchMap.find(path);
+        if (pathIt != m_pathWatchMap.end()) {
+            wd = pathIt->second;
+        } else {
+            wd = inotify_add_watch(m_inotifyFd, path.c_str(),
+                IN_CREATE | IN_CLOSE_WRITE | IN_DELETE | IN_DELETE_SELF | IN_MOVED_FROM | IN_MOVED_TO);
+            if (wd == -1) {
+                return -1;
+            }
+            m_watchMap[wd] = path;
+            m_pathWatchMap[path] = wd;
+        }
+
+        m_watchRecursive[wd] = m_watchRecursive[wd] || recursive;
+        m_rootWatches[rootPath].associatedWds.insert(wd);
+        m_wdToRoots[wd].insert(rootPath);
+        return wd;
     }
 
-    // TODO 目录监控失败时，应该有错误反馈机制，目前是直接忽略了。
-    void addDirectoryWatch(const std::string& path, bool recursive) {
-        if (isPathWatched(path)) {
+    void addRecursiveWatches(const std::string& path, const std::string& rootPath) {
+        addDirectoryWatch(path, rootPath, true);
+
+        DIR* dir = opendir(path.c_str());
+        if (!dir) {
             return;
         }
 
-        int wd = inotify_add_watch(m_inotifyFd, path.c_str(),
-            IN_CREATE | IN_CLOSE_WRITE | IN_DELETE | IN_DELETE_SELF | IN_MOVED_FROM | IN_MOVED_TO);
-        if (wd == -1) {
-            return;
+        struct dirent* entry;
+        while ((entry = readdir(dir)) != nullptr) {
+            // 跳过 . 和 .. 目录
+            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+                continue;
+            }
+
+            std::string childPath = path + "/" + entry->d_name;
+            struct stat statbuf;
+            if (stat(childPath.c_str(), &statbuf) == 0 && S_ISDIR(statbuf.st_mode)) {
+                addRecursiveWatches(childPath, rootPath);
+            }
         }
 
-        std::lock_guard<std::mutex> lock(m_mutex);
-        m_watchMap[wd] = path;
-        m_pathWatchMap[path] = wd;
-        m_watchRecursive[wd] = recursive;
+        closedir(dir);
     }
 
     void emitCreateEventsForExistingEntries(const std::string& path) {
@@ -270,34 +362,29 @@ private:
         }
     }
 
-    void addRecursiveWatches(const std::string& path, bool recursive) {
-        // 关键修复：先确保目录本身被监控，再递归子目录。
-        addDirectoryWatch(path, recursive);
-
-        DIR* dir = opendir(path.c_str());
-        if (!dir) {
+    void processEvent(struct inotify_event* event) {
+        if (event->mask & IN_IGNORED) {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            const int wd = event->wd;
+            auto wIt = m_watchMap.find(wd);
+            if (wIt != m_watchMap.end()) {
+                m_pathWatchMap.erase(wIt->second);
+                m_watchMap.erase(wIt);
+            }
+            m_watchRecursive.erase(wd);
+            auto rIt = m_wdToRoots.find(wd);
+            if (rIt != m_wdToRoots.end()) {
+                for (const auto& rPath : rIt->second) {
+                    auto rootIt = m_rootWatches.find(rPath);
+                    if (rootIt != m_rootWatches.end()) {
+                        rootIt->second.associatedWds.erase(wd);
+                    }
+                }
+                m_wdToRoots.erase(rIt);
+            }
             return;
         }
 
-        struct dirent* entry;
-        while ((entry = readdir(dir)) != nullptr) {
-            // 跳过 . 和 .. 目录
-            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
-                continue;
-            }
-
-            std::string childPath = path + "/" + entry->d_name;
-            struct stat statbuf;
-            if (stat(childPath.c_str(), &statbuf) == 0 && S_ISDIR(statbuf.st_mode)) {
-                // 递归处理子目录 (函数内部会为子目录本身加 watch)
-                addRecursiveWatches(childPath, recursive);
-            }
-        }
-
-        closedir(dir);
-    }
-
-    void processEvent(struct inotify_event* event) {
         std::string path;
         bool recursiveWatch = false;
         {
@@ -328,7 +415,22 @@ private:
             fileEvent = FileEvent(EventType::kCreate, path, pathType);
             // 如果创建的是目录，递归添加监控
             if ((event->mask & IN_ISDIR) && recursiveWatch) {
-                addRecursiveWatches(path, true);
+                std::vector<std::string> roots;
+                {
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                    auto it = m_wdToRoots.find(event->wd);
+                    if (it != m_wdToRoots.end()) {
+                        for (const auto& r : it->second) {
+                            auto rwIt = m_rootWatches.find(r);
+                            if (rwIt != m_rootWatches.end() && rwIt->second.recursive) {
+                                roots.push_back(r);
+                            }
+                        }
+                    }
+                }
+                for (const auto& r : roots) {
+                    addRecursiveWatches(path, r);
+                }
                 // 目录创建后可能已快速写入文件，做一次现状补采样。
                 emitCreateEventsForExistingEntries(path);
             }
@@ -370,7 +472,22 @@ private:
             }
             // 如果移动的是目录，递归添加监控
             if ((event->mask & IN_ISDIR) && recursiveWatch) {
-                addRecursiveWatches(path, true);
+                std::vector<std::string> roots;
+                {
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                    auto it = m_wdToRoots.find(event->wd);
+                    if (it != m_wdToRoots.end()) {
+                        for (const auto& r : it->second) {
+                            auto rwIt = m_rootWatches.find(r);
+                            if (rwIt != m_rootWatches.end() && rwIt->second.recursive) {
+                                roots.push_back(r);
+                            }
+                        }
+                    }
+                }
+                for (const auto& r : roots) {
+                    addRecursiveWatches(path, r);
+                }
                 // 目录整体移动进来时，补发子树 CREATE 事件，避免漏报。
                 emitCreateEventsForExistingEntries(path);
             }

@@ -42,8 +42,73 @@ filewatch::FileWatcher::Filter& filewatch::FileWatcher::Filter::setPathPattern(c
     return *this;
 }
 
+filewatch::FileWatcher::Filter& filewatch::FileWatcher::Filter::addExcludePattern(const std::string& pattern) {
+    try {
+        m_excludePatterns.emplace_back(pattern);
+    } catch (const std::regex_error&) {
+    }
+    return *this;
+}
+
+filewatch::FileWatcher::Filter& filewatch::FileWatcher::Filter::setExcludePatterns(const std::vector<std::string>& patterns) {
+    m_excludePatterns.clear();
+    for (const auto& pat : patterns) {
+        addExcludePattern(pat);
+    }
+    return *this;
+}
+
+filewatch::FileWatcher::Filter& filewatch::FileWatcher::Filter::addExcludePath(const std::string& path) {
+    if (!path.empty()) {
+        std::string p = path;
+        std::replace(p.begin(), p.end(), '\\', '/');
+        while (p.size() > 1 && p.back() == '/') {
+            p.pop_back();
+        }
+        m_excludePaths.push_back(p);
+    }
+    return *this;
+}
+
+filewatch::FileWatcher::Filter& filewatch::FileWatcher::Filter::setExcludePaths(const std::vector<std::string>& paths) {
+    m_excludePaths.clear();
+    for (const auto& p : paths) {
+        addExcludePath(p);
+    }
+    return *this;
+}
+
 bool filewatch::FileWatcher::Filter::passes(const FileEvent& event) const {
-    // 检查事件类型
+    const std::string& rawPath = event.getPath();
+
+    // 1. 检查固定排除路径（黑名单）
+    if (!m_excludePaths.empty()) {
+        std::string normalizedEventPath = rawPath;
+        std::replace(normalizedEventPath.begin(), normalizedEventPath.end(), '\\', '/');
+        while (normalizedEventPath.size() > 1 && normalizedEventPath.back() == '/') {
+            normalizedEventPath.pop_back();
+        }
+
+        for (const auto& excludePath : m_excludePaths) {
+            if (normalizedEventPath == excludePath) {
+                return false;
+            }
+            if (normalizedEventPath.size() > excludePath.size() &&
+                normalizedEventPath.compare(0, excludePath.size(), excludePath) == 0 &&
+                (excludePath.back() == '/' || normalizedEventPath[excludePath.size()] == '/')) {
+                return false;
+            }
+        }
+    }
+
+    // 2. 检查排除正则模式（黑名单）
+    for (const auto& pattern : m_excludePatterns) {
+        if (std::regex_search(rawPath, pattern)) {
+            return false;
+        }
+    }
+
+    // 3. 检查事件类型
     if (!m_eventTypes.empty()) {
         bool found = false;
         for (const auto& type : m_eventTypes) {
@@ -57,7 +122,7 @@ bool filewatch::FileWatcher::Filter::passes(const FileEvent& event) const {
         }
     }
 
-    // 检查文件扩展名
+    // 4. 检查文件扩展名
     if (!m_extensions.empty() && event.getPathType() == PathType::FILE) {
         const std::string& path = event.getPath();
         size_t dotPos = path.rfind('.');
@@ -78,7 +143,7 @@ bool filewatch::FileWatcher::Filter::passes(const FileEvent& event) const {
         }
     }
 
-    // 检查路径模式
+    // 5. 检查路径白名单模式
     if (m_hasPathPattern) {
         if (!std::regex_match(event.getPath(), m_pathPattern)) {
             return false;
@@ -451,14 +516,14 @@ private:
     std::chrono::steady_clock::time_point m_lastDebounceCleanup; // 上次清理时间
 
     void cleanupDebounceMap(const std::chrono::steady_clock::time_point& now) {
-        const long sinceLastCleanup = std::chrono::duration_cast<std::chrono::milliseconds>(now - m_lastDebounceCleanup).count();
+        const int64_t sinceLastCleanup = std::chrono::duration_cast<std::chrono::milliseconds>(now - m_lastDebounceCleanup).count();
         if (sinceLastCleanup < m_debounceCleanupIntervalMs) {
             return;
         }
 
-        const long expireMs = m_debounceExpireMs;
+        const int64_t expireMs = m_debounceExpireMs;
         for (std::unordered_map<std::string, std::chrono::steady_clock::time_point>::iterator it = m_debounceMap.begin(); it != m_debounceMap.end();) {
-            const long age = std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second).count();
+            const int64_t age = std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second).count();
             if (age > expireMs) {
                 it = m_debounceMap.erase(it);
             } else {

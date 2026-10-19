@@ -836,6 +836,154 @@ TEST_CASE("FileWatcher class tests", "[FileWatcher]") {
         ::rmdir(baseDir.c_str());
     }
 
+    SECTION("removeWatch cascades to subdirectories for recursive watches") {
+        char tmpTemplate[] = "/tmp/filewatch_rmcascade_ut_XXXXXX";
+        char* created = mkdtemp(tmpTemplate);
+        REQUIRE(created != nullptr);
+        std::string baseDir = filewatch::utils::PathUtils::getAbsolutePath(created);
+        std::string subDir = baseDir + "/subdir";
+        REQUIRE(mkdir(subDir.c_str(), 0755) == 0);
+
+        std::string subFileBefore = subDir + "/before.txt";
+        std::string subFileAfter = subDir + "/after.txt";
+
+        filewatch::FileWatcher watcher;
+        std::vector<filewatch::FileEvent> captured;
+        std::mutex capturedMutex;
+
+        bool added = watcher.addWatch(baseDir, true, [&captured, &capturedMutex](const filewatch::FileEvent& event) {
+            std::lock_guard<std::mutex> lock(capturedMutex);
+            captured.push_back(event);
+        });
+        REQUIRE(added == true);
+
+        std::atomic<bool> started(false);
+        std::thread startThread([&watcher, &started]() {
+            started = watcher.start();
+        });
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+        // 移除前在子目录创建文件，应该被捕获
+        {
+            std::ofstream ofs(subFileBefore.c_str());
+            ofs << "sub_before";
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+        // 移除递归监控根目录
+        REQUIRE(watcher.removeWatch(baseDir) == true);
+
+        // 移除后在子目录创建文件，不应该被捕获（子目录的 watch 已被级联移除）
+        {
+            std::ofstream ofs(subFileAfter.c_str());
+            ofs << "sub_after";
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+        watcher.stop();
+        startThread.join();
+        REQUIRE(started == true);
+
+        bool sawBefore = false;
+        bool sawAfter = false;
+        {
+            std::lock_guard<std::mutex> lock(capturedMutex);
+            for (const auto& e : captured) {
+                if (e.getPath() == subFileBefore) {
+                    sawBefore = true;
+                }
+                if (e.getPath() == subFileAfter) {
+                    sawAfter = true;
+                }
+            }
+        }
+
+        REQUIRE(sawBefore == true);
+        REQUIRE(sawAfter == false);
+
+        ::unlink(subFileBefore.c_str());
+        ::unlink(subFileAfter.c_str());
+        ::rmdir(subDir.c_str());
+        ::rmdir(baseDir.c_str());
+    }
+
+    SECTION("Dynamic build directories exclusion in runtime") {
+        char tmpTemplate[] = "/tmp/filewatch_rmexclude_ut_XXXXXX";
+        char* created = mkdtemp(tmpTemplate);
+        REQUIRE(created != nullptr);
+        std::string baseDir = filewatch::utils::PathUtils::getAbsolutePath(created);
+        std::string srcDir = baseDir + "/src";
+        REQUIRE(mkdir(srcDir.c_str(), 0755) == 0);
+
+        filewatch::FileWatcher watcher;
+        filewatch::FileWatcher::Filter filter;
+        // 动态排除以 build- 开头的任何目录
+        filter.addExcludePattern(R"((^|[/\\])build-[^/\\]+([/\\]|$))");
+        watcher.setFilter(filter);
+
+        std::vector<filewatch::FileEvent> captured;
+        std::mutex capturedMutex;
+
+        bool added = watcher.addWatch(baseDir, true, [&captured, &capturedMutex](const filewatch::FileEvent& event) {
+            std::lock_guard<std::mutex> lock(capturedMutex);
+            captured.push_back(event);
+        });
+        REQUIRE(added == true);
+
+        std::atomic<bool> started(false);
+        std::thread startThread([&watcher, &started]() {
+            started = watcher.start();
+        });
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+        // 动态创建编译目录 build-debug 并在其中生成目标文件
+        std::string buildDebugDir = baseDir + "/build-debug";
+        REQUIRE(mkdir(buildDebugDir.c_str(), 0755) == 0);
+        std::string objFile = buildDebugDir + "/main.o";
+        {
+            std::ofstream ofs(objFile.c_str());
+            ofs << "binary data";
+        }
+
+        // 正常业务文件
+        std::string srcFile = srcDir + "/main.cpp";
+        {
+            std::ofstream ofs(srcFile.c_str());
+            ofs << "int main() {}";
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+
+        watcher.stop();
+        startThread.join();
+        REQUIRE(started == true);
+
+        bool sawSrc = false;
+        bool sawBuildDebug = false;
+        {
+            std::lock_guard<std::mutex> lock(capturedMutex);
+            for (const auto& e : captured) {
+                if (e.getPath() == srcFile) {
+                    sawSrc = true;
+                }
+                if (e.getPath().find("build-debug") != std::string::npos) {
+                    sawBuildDebug = true;
+                }
+            }
+        }
+
+        REQUIRE(sawSrc == true);
+        REQUIRE(sawBuildDebug == false);
+
+        ::unlink(objFile.c_str());
+        ::rmdir(buildDebugDir.c_str());
+        ::unlink(srcFile.c_str());
+        ::rmdir(srcDir.c_str());
+        ::rmdir(baseDir.c_str());
+    }
+
     SECTION("Multiple watched directories callback isolation") {
         char tmpTemplateA[] = "/tmp/filewatch_multia_ut_XXXXXX";
         char tmpTemplateB[] = "/tmp/filewatch_multib_ut_XXXXXX";
@@ -1048,6 +1196,47 @@ TEST_CASE("Filter class tests", "[Filter]") {
         REQUIRE(filter.passes(diffType) == false);
         REQUIRE(filter.passes(diffExt) == false);
         REQUIRE(filter.passes(diffPath) == false);
+    }
+
+    SECTION("Exclude paths filtering") {
+        filewatch::FileWatcher::Filter filter;
+        filter.addExcludePath("/home/tony/work/temp")
+              .addExcludePath("/home/tony/work/ignored_dir");
+
+        filewatch::FileEvent evNormal(filewatch::EventType::kCreate, "/home/tony/work/main.cpp", filewatch::PathType::FILE);
+        filewatch::FileEvent evIgnoredSelf(filewatch::EventType::kModify, "/home/tony/work/temp", filewatch::PathType::DIRECTORY);
+        filewatch::FileEvent evIgnoredChild(filewatch::EventType::kCreate, "/home/tony/work/temp/sub/cache.tmp", filewatch::PathType::FILE);
+        filewatch::FileEvent evIgnoredDirChild(filewatch::EventType::kDelete, "/home/tony/work/ignored_dir/log.txt", filewatch::PathType::FILE);
+        filewatch::FileEvent evSimilarName(filewatch::EventType::kCreate, "/home/tony/work/temporary.cpp", filewatch::PathType::FILE);
+
+        REQUIRE(filter.passes(evNormal) == true);
+        REQUIRE(filter.passes(evIgnoredSelf) == false);
+        REQUIRE(filter.passes(evIgnoredChild) == false);
+        REQUIRE(filter.passes(evIgnoredDirChild) == false);
+        // /home/tony/work/temporary.cpp 虽然前缀包含 temp，但不是其子目录或完全相等，不应该被误伤
+        REQUIRE(filter.passes(evSimilarName) == true);
+    }
+
+    SECTION("Exclude regex patterns filtering (e.g. build-* and .git)") {
+        filewatch::FileWatcher::Filter filter;
+        // 排除任意以 build- 开头的目录（不带文件扩展名点号）及其子文件，以及 .git 目录
+        filter.addExcludePattern(R"((^|[/\\])build-[^./\\]+([/\\]|$))")
+              .addExcludePattern(R"((^|[/\\])\.git([/\\]|$))");
+
+        filewatch::FileEvent evSrc(filewatch::EventType::kCreate, "/home/tony/work/src/main.cpp", filewatch::PathType::FILE);
+        filewatch::FileEvent evBuildDebugDir(filewatch::EventType::kCreate, "/home/tony/work/build-debug", filewatch::PathType::DIRECTORY);
+        filewatch::FileEvent evBuildDebugObj(filewatch::EventType::kModify, "/home/tony/work/build-debug/main.o", filewatch::PathType::FILE);
+        filewatch::FileEvent evNestedBuild(filewatch::EventType::kCreate, "/home/tony/work/subproject/build-release/lib.a", filewatch::PathType::FILE);
+        filewatch::FileEvent evGit(filewatch::EventType::kModify, "/home/tony/work/.git/index", filewatch::PathType::FILE);
+        filewatch::FileEvent evBuildScript(filewatch::EventType::kCreate, "/home/tony/work/src/build-script.py", filewatch::PathType::FILE);
+
+        REQUIRE(filter.passes(evSrc) == true);
+        REQUIRE(filter.passes(evBuildDebugDir) == false);
+        REQUIRE(filter.passes(evBuildDebugObj) == false);
+        REQUIRE(filter.passes(evNestedBuild) == false);
+        REQUIRE(filter.passes(evGit) == false);
+        // build-script.py 带有 .py 后缀并非纯目录名，不应被排除
+        REQUIRE(filter.passes(evBuildScript) == true);
     }
 }
 
