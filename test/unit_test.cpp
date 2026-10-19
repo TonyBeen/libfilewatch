@@ -3,6 +3,7 @@
 
 #include "filewatch/FileWatcher.h"
 #include "filewatch/Event.h"
+#include "filewatch/Version.h"
 #include "utils/PathUtils.h"
 #include "utils/EncodingUtils.h"
 #include <thread>
@@ -1560,6 +1561,21 @@ TEST_CASE("Timer class and management tests", "[Timer]") {
         t3 = std::move(t2);
         REQUIRE(t3.isRepeating() == true);
         REQUIRE(t2.isActive() == false);
+    }
+}
+
+// 测试 Version 头文件与动态版本号
+TEST_CASE("Version header tests", "[Version]") {
+    SECTION("Version macros and constants") {
+        REQUIRE(LIBFILEWATCH_VERSION_MAJOR >= 0);
+        REQUIRE(LIBFILEWATCH_VERSION_MINOR >= 0);
+        REQUIRE(LIBFILEWATCH_VERSION_PATCH >= 0);
+        REQUIRE(filewatch::Version::major() == LIBFILEWATCH_VERSION_MAJOR);
+        REQUIRE(filewatch::Version::minor() == LIBFILEWATCH_VERSION_MINOR);
+        REQUIRE(filewatch::Version::patch() == LIBFILEWATCH_VERSION_PATCH);
+        REQUIRE(std::string(filewatch::Version::string()) == LIBFILEWATCH_VERSION_STRING);
+        REQUIRE(std::string(filewatch::getVersionString()) == LIBFILEWATCH_VERSION_STRING);
+        REQUIRE(filewatch::Version::commitCount() == LIBFILEWATCH_COMMIT_COUNT);
     }
 }
 
