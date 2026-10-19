@@ -1,35 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-
-# 获取 git 提交次数并计算版本号（以 0.1.0 为基点，每提交 1 次计数加 1，10 进制进位：如 11 次对应 0.2.1）
-find_package(Git QUIET)
-set(LIBFILEWATCH_COMMIT_COUNT 0)
-if(GIT_FOUND AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
-    execute_process(
-        COMMAND ${GIT_EXECUTABLE} rev-list --count HEAD
-        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-        OUTPUT_VARIABLE _git_commit_count
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-        RESULT_VARIABLE _git_res
-    )
-    if(_git_res EQUAL 0 AND _git_commit_count MATCHES "^[0-9]+$")
-        set(LIBFILEWATCH_COMMIT_COUNT ${_git_commit_count})
-    endif()
-
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git/HEAD")
-        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/.git/HEAD")
-    endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git/index")
-        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/.git/index")
-    endif()
-endif()
-
-math(EXPR _total_version_number "10 + ${LIBFILEWATCH_COMMIT_COUNT}")
-math(EXPR LIBFILEWATCH_VERSION_MAJOR "${_total_version_number} / 100")
-math(EXPR LIBFILEWATCH_VERSION_MINOR "(${_total_version_number} % 100) / 10")
-math(EXPR LIBFILEWATCH_VERSION_PATCH "${_total_version_number} % 10")
-set(LIBFILEWATCH_VERSION_STRING "${LIBFILEWATCH_VERSION_MAJOR}.${LIBFILEWATCH_VERSION_MINOR}.${LIBFILEWATCH_VERSION_PATCH}")
-
-project(libfilewatch VERSION ${LIBFILEWATCH_VERSION_STRING} LANGUAGES CXX)
+project(libfilewatch VERSION 0.2.5 LANGUAGES CXX)
 
 # 动态生成 Version.h
 configure_file(

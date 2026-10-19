@@ -1575,7 +1575,6 @@ TEST_CASE("Version header tests", "[Version]") {
         REQUIRE(filewatch::Version::patch() == LIBFILEWATCH_VERSION_PATCH);
         REQUIRE(std::string(filewatch::Version::string()) == LIBFILEWATCH_VERSION_STRING);
         REQUIRE(std::string(filewatch::getVersionString()) == LIBFILEWATCH_VERSION_STRING);
-        REQUIRE(filewatch::Version::commitCount() == LIBFILEWATCH_COMMIT_COUNT);
     }
 }
 

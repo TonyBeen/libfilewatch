@@ -1,24 +1,22 @@
 #ifndef FILEWATCH_VERSION_H
 #define FILEWATCH_VERSION_H
 
-#define LIBFILEWATCH_VERSION_MAJOR @LIBFILEWATCH_VERSION_MAJOR@
-#define LIBFILEWATCH_VERSION_MINOR @LIBFILEWATCH_VERSION_MINOR@
-#define LIBFILEWATCH_VERSION_PATCH @LIBFILEWATCH_VERSION_PATCH@
-#define LIBFILEWATCH_VERSION_STRING "@LIBFILEWATCH_VERSION_STRING@"
-#define LIBFILEWATCH_COMMIT_COUNT @LIBFILEWATCH_COMMIT_COUNT@
+#define LIBFILEWATCH_VERSION_MAJOR 0
+#define LIBFILEWATCH_VERSION_MINOR 2
+#define LIBFILEWATCH_VERSION_PATCH 5
+#define LIBFILEWATCH_VERSION_STRING "0.2.5"
 
 namespace filewatch {
 
 struct Version {
-    static int major() noexcept { return @LIBFILEWATCH_VERSION_MAJOR@; }
-    static int minor() noexcept { return @LIBFILEWATCH_VERSION_MINOR@; }
-    static int patch() noexcept { return @LIBFILEWATCH_VERSION_PATCH@; }
-    static const char* string() noexcept { return "@LIBFILEWATCH_VERSION_STRING@"; }
-    static int commitCount() noexcept { return @LIBFILEWATCH_COMMIT_COUNT@; }
+    static int major() noexcept { return 0; }
+    static int minor() noexcept { return 2; }
+    static int patch() noexcept { return 5; }
+    static const char* string() noexcept { return "0.2.5"; }
 };
 
 inline const char* getVersionString() noexcept {
-    return "@LIBFILEWATCH_VERSION_STRING@";
+    return "0.2.5";
 }
 
 } // namespace filewatch
